@@ -1,0 +1,35 @@
+var var1;
+
+var var2 = 10;
+
+const const1 = 20;
+
+fn fn1 () {}
+fn fn2 (a) {}
+fn fn3 (a,b) {}
+fn fn3 (a,b,c) {}
+fn fn4 (a,b,c) {
+  {}
+  {}
+}
+fn fn5 (a,b,c) {
+  break;
+}
+fn fn6 (a,b,c) {
+  continue;
+}
+fn fn7 (a,b,c) {
+  return;
+}
+fn fn8 (a,b,c) {
+  return 30;
+}
+fn fn9 (a,b,c) {
+  if(30) { }
+}
+fn fn10 (a,b,c) {
+  if(30) { } else { }
+}
+fn fn11 (a,b,c) {
+  while(30) { }
+}
