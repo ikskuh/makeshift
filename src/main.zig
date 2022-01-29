@@ -147,16 +147,6 @@ const Parser = struct {
         };
     }
 
-    fn parseExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
-        const start_token = try parser.accept(comptime Rules.oneOf(.{ .number, .identifier }));
-        return switch (start_token.type) {
-            .number => try ast.memoize(Ast.Expression{ .number = start_token.text }),
-            .identifier => try ast.memoize(Ast.Expression{ .identifier = start_token.text }),
-
-            else => return error.SyntaxError,
-        };
-    }
-
     fn parseBlock(ast: *Ast, parser: *ParserCore) Error!*Ast.Statement {
         _ = try parser.accept(comptime Rules.is(.@"{"));
 
@@ -338,6 +328,147 @@ const Parser = struct {
             return item;
         }
     }
+
+    fn parseExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
+        return try parseBinaryOpExpression(ast, parser);
+    }
+
+    fn parseBinaryOpExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
+        const lhs = try parsePrefixOpExpression(ast, parser);
+
+        const any_binop = comptime enumToTokenSet(BinaryOperator);
+
+        if (parser.accept(comptime Rules.oneOf(any_binop))) |op| {
+            const operator = tokenToEnumVal(op.type, BinaryOperator);
+
+            const rhs = try parseBinaryOpExpression(ast, parser);
+
+            return try ast.memoize(Ast.Expression{
+                .binary_operation = .{
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .operator = operator,
+                },
+            });
+        } else |_| {
+            return lhs;
+        }
+    }
+    fn parsePrefixOpExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
+        const any_unop = comptime enumToTokenSet(UnaryOperator);
+
+        if (parser.accept(comptime Rules.oneOf(any_unop))) |op| {
+            const operator = tokenToEnumVal(op.type, UnaryOperator);
+            const value = try parsePrefixOpExpression(ast, parser);
+
+            return try ast.memoize(Ast.Expression{
+                .unary_operation = .{
+                    .value = value,
+                    .operator = operator,
+                },
+            });
+        } else |_| {
+            return try parseSuffixOpExpression(ast, parser);
+        }
+    }
+
+    fn parseSuffixOpExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
+        var expr = try parseAtomExpression(ast, parser);
+
+        while (parser.accept(comptime Rules.oneOf(.{ .@"{", .@"[", .@"(" }))) |op| {
+            switch (op.type) {
+                .@"{" => {
+                    const index = try parseExpression(ast, parser);
+                    _ = try parser.accept(comptime Rules.is(.@"}"));
+
+                    const value = expr;
+                    expr = try ast.memoize(Ast.Expression{
+                        .indexing = .{
+                            .word_size = .byte,
+                            .value = value,
+                            .index = index,
+                        },
+                    });
+                },
+                .@"[" => {
+                    const index = try parseExpression(ast, parser);
+                    _ = try parser.accept(comptime Rules.is(.@"]"));
+
+                    const value = expr;
+                    expr = try ast.memoize(Ast.Expression{
+                        .indexing = .{
+                            .word_size = .word,
+                            .value = value,
+                            .index = index,
+                        },
+                    });
+                },
+                .@"(" => {
+                    var call = Ast.Call{
+                        .function = expr,
+                        .args = null,
+                    };
+                    if (parser.accept(comptime Rules.is(.@")"))) |_| {
+                        // everything fine here
+                    } else |_| {
+                        var previous_arg: ?*Ast.ValueList = null;
+
+                        while (true) {
+                            const arg = try parseExpression(ast, parser);
+
+                            const item = try ast.memoize(Ast.ValueList{
+                                .value = arg,
+                                .next = null,
+                            });
+
+                            if (previous_arg) |prev| {
+                                prev.next = item;
+                            }
+                            if (call.args == null) {
+                                call.args = item;
+                            }
+                            previous_arg = item;
+
+                            const delimit = try parser.accept(comptime Rules.oneOf(.{ .@",", .@")" }));
+                            if (delimit.type == .@")")
+                                break;
+                        }
+                    }
+                    expr = try ast.memoize(Ast.Expression{
+                        .call = call,
+                    });
+                },
+
+                else => unreachable,
+            }
+        } else |_| {
+            return expr;
+        }
+    }
+
+    fn parseAtomExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
+        const start_token = try parser.accept(comptime Rules.oneOf(.{ .number, .identifier, .@"(", .@"[", .@"{" }));
+        return switch (start_token.type) {
+            .number => try ast.memoize(Ast.Expression{ .number = start_token.text }),
+            .identifier => try ast.memoize(Ast.Expression{ .identifier = start_token.text }),
+
+            .@"{" => {
+                @panic("not implemented yet");
+            },
+
+            .@"[" => {
+                @panic("not implemented yet");
+            },
+
+            .@"(" => {
+                const expr = try parseExpression(ast, parser);
+                _ = try parser.accept(comptime Rules.is(.@")"));
+                return expr;
+            },
+
+            else => return error.SyntaxError,
+        };
+    }
 };
 
 fn AstPrinter(comptime Writer: type) type {
@@ -455,10 +586,64 @@ fn AstPrinter(comptime Writer: type) type {
         }
 
         fn printExpr(expr: Ast.Expression, writer: Writer) Error!void {
-            switch (expr) {
-                .number, .identifier => |val| try writer.writeAll(val),
+            // try writer.writeAll("( ");
+            // defer writer.writeAll(" )") catch {};
 
-                // else => try writer.print("<expr:{s}>", .{@tagName(expr)}),
+            switch (expr) {
+                .number => |val| try writer.writeAll(val),
+                .identifier => |val| try writer.writeAll(val),
+                .string => |val| try writer.writeAll(val),
+                .binary_operation => |val| {
+                    try writer.writeAll("(");
+                    try printExpr(val.lhs.*, writer);
+                    try writer.print(" {s} ", .{@tagName(val.operator)});
+                    try printExpr(val.rhs.*, writer);
+                    try writer.writeAll(")");
+                },
+                .unary_operation => |val| {
+                    try writer.writeAll("(");
+                    try writer.writeAll(@tagName(val.operator));
+                    try printExpr(val.value.*, writer);
+                    try writer.writeAll(")");
+                },
+                .indexing => |val| {
+                    const braces = switch (val.word_size) {
+                        .byte => "{}",
+                        .word => "[]",
+                    };
+
+                    try printExpr(val.value.*, writer);
+                    try writer.writeAll(braces[0..1]);
+                    try printExpr(val.index.*, writer);
+                    try writer.writeAll(braces[1..2]);
+                },
+                .call => |val| {
+                    try printExpr(val.function.*, writer);
+                    try writer.writeAll("(");
+                    var current_arg = val.args;
+                    while (current_arg) |arg| : (current_arg = arg.next) {
+                        try printExpr(arg.value.*, writer);
+                        if (arg.next != null) {
+                            try writer.writeAll(", ");
+                        }
+                    }
+                    try writer.writeAll(")");
+                },
+                .array_init => |val| {
+                    const braces = switch (val.word_size) {
+                        .byte => "{}",
+                        .word => "[]",
+                    };
+                    try writer.writeAll(braces[0..1]);
+                    var current_arg = val.values;
+                    while (current_arg) |arg| : (current_arg = arg.next) {
+                        try printExpr(arg.value.*, writer);
+                        if (arg.next != null) {
+                            try writer.writeAll(", ");
+                        }
+                    }
+                    try writer.writeAll(braces[1..2]);
+                },
             }
         }
 
@@ -515,6 +700,7 @@ const TokenType = enum(u8) {
     @">=",
     @"<=",
     @"==",
+    @"!=",
     @">>",
     @">>>",
     @"<<",
@@ -540,11 +726,13 @@ const Tokenizer = ptk.Tokenizer(TokenType, &.{
     Pattern.create(.@"else", ptk.matchers.word("else")),
     Pattern.create(.@"while", ptk.matchers.word("while")),
 
+    Pattern.create(.@">>>", ptk.matchers.literal(">>>")),
+
     Pattern.create(.@">=", ptk.matchers.literal(">=")),
     Pattern.create(.@"<=", ptk.matchers.literal("<=")),
     Pattern.create(.@"==", ptk.matchers.literal("==")),
+    Pattern.create(.@"!=", ptk.matchers.literal("!=")),
     Pattern.create(.@">>", ptk.matchers.literal(">>")),
-    Pattern.create(.@">>>", ptk.matchers.literal(">>>")),
     Pattern.create(.@"<<", ptk.matchers.literal("<<")),
 
     Pattern.create(.@";", ptk.matchers.literal(";")),
@@ -673,5 +861,93 @@ const Ast = struct {
     pub const Expression = union(enum) {
         number: []const u8,
         identifier: []const u8,
+        string: []const u8,
+
+        binary_operation: BinaryOperation,
+        unary_operation: UnaryOperation,
+
+        indexing: Indexer,
+
+        call: Call,
+        array_init: ArrayInitializer,
+    };
+
+    pub const BinaryOperation = struct {
+        lhs: *Expression,
+        rhs: *Expression,
+        operator: BinaryOperator,
+    };
+
+    pub const UnaryOperation = struct {
+        value: *Expression,
+        operator: UnaryOperator,
+    };
+
+    pub const Indexer = struct {
+        value: *Expression,
+        index: *Expression,
+
+        word_size: MemoryAccessSize,
+    };
+
+    pub const Call = struct {
+        function: *Expression,
+        args: ?*ValueList,
+    };
+
+    pub const ArrayInitializer = struct {
+        word_size: MemoryAccessSize,
+        values: ?*ValueList,
+    };
+
+    pub const ValueList = struct {
+        value: *Expression,
+        next: ?*ValueList,
     };
 };
+pub const MemoryAccessSize = enum { byte, word };
+
+pub const BinaryOperator = enum {
+    @"+",
+    @"-",
+    @"*",
+    @"/",
+    @"%",
+    @"&",
+    @"|",
+    @"^",
+    @">",
+    @"<",
+    @">=",
+    @"<=",
+    @"==",
+    @"!=",
+    @"and",
+    @"or",
+};
+
+pub const UnaryOperator = enum {
+    @"-",
+    @"~",
+    @"!",
+    @"&",
+    @"<<",
+    @">>",
+    @">>>",
+};
+
+fn enumToTokenSet(comptime T: type) [std.meta.fields(T).len]TokenType {
+    var toks: [std.meta.fields(T).len]TokenType = undefined;
+    inline for (std.meta.fields(T)) |fld, i| {
+        toks[i] = @field(TokenType, fld.name);
+    }
+    return toks;
+}
+
+fn tokenToEnumVal(token: TokenType, comptime T: type) T {
+    inline for (std.meta.fields(T)) |fld| {
+        if (token == @field(TokenType, fld.name))
+            return @field(T, fld.name);
+    }
+    @panic("received invalid token. check the pattern matching before!");
+}

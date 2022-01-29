@@ -25,7 +25,7 @@ expression  := <binary_op>
 binary_op   := <prefix_op> ( <binary_sig> <prefix_op> )*
 binary_sig  := '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '>' | '<' | '>=' | '<=' | '==' | '!=' | 'and' | 'or' 
 
-prefix_op   := ( '~' | '!' | '&' | '<<' | '>>' | '>>>' ) + <suffix_op>
+prefix_op   := ( '-' | '~' | '!' | '&' | '<<' | '>>' | '>>>' )+ <suffix_op>
 
 suffix_op   := <atom> '(' <params> ')' | <atom> '[' <expression> ']' | <atom> '{' <expression> '}' | <atom>
 
