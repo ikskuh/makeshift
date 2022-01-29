@@ -408,32 +408,8 @@ const Parser = struct {
                         .function = expr,
                         .args = null,
                     };
-                    if (parser.accept(comptime Rules.is(.@")"))) |_| {
-                        // everything fine here
-                    } else |_| {
-                        var previous_arg: ?*Ast.ValueList = null;
 
-                        while (true) {
-                            const arg = try parseExpression(ast, parser);
-
-                            const item = try ast.memoize(Ast.ValueList{
-                                .value = arg,
-                                .next = null,
-                            });
-
-                            if (previous_arg) |prev| {
-                                prev.next = item;
-                            }
-                            if (call.args == null) {
-                                call.args = item;
-                            }
-                            previous_arg = item;
-
-                            const delimit = try parser.accept(comptime Rules.oneOf(.{ .@",", .@")" }));
-                            if (delimit.type == .@")")
-                                break;
-                        }
-                    }
+                    call.args = try parseValueList(ast, parser, .@")");
                     expr = try ast.memoize(Ast.Expression{
                         .call = call,
                     });
@@ -453,11 +429,19 @@ const Parser = struct {
             .identifier => try ast.memoize(Ast.Expression{ .identifier = start_token.text }),
 
             .@"{" => {
-                @panic("not implemented yet");
+                const list = try parseValueList(ast, parser, .@"}");
+                return try ast.memoize(Ast.Expression{ .array_init = .{
+                    .word_size = .byte,
+                    .values = list,
+                } });
             },
 
             .@"[" => {
-                @panic("not implemented yet");
+                const list = try parseValueList(ast, parser, .@"]");
+                return try ast.memoize(Ast.Expression{ .array_init = .{
+                    .word_size = .word,
+                    .values = list,
+                } });
             },
 
             .@"(" => {
@@ -468,6 +452,36 @@ const Parser = struct {
 
             else => return error.SyntaxError,
         };
+    }
+
+    fn parseValueList(ast: *Ast, parser: *ParserCore, comptime delimiter: TokenType) Error!?*Ast.ValueList {
+        var head: ?*Ast.ValueList = null;
+        if (parser.accept(comptime Rules.is(delimiter))) |_| {
+            // everything fine here
+        } else |_| {
+            var previous_item: ?*Ast.ValueList = null;
+            while (true) {
+                const value = try parseExpression(ast, parser);
+
+                const item = try ast.memoize(Ast.ValueList{
+                    .value = value,
+                    .next = null,
+                });
+
+                if (previous_item) |prev| {
+                    prev.next = item;
+                }
+                if (head == null) {
+                    head = item;
+                }
+                previous_item = item;
+
+                const delimit = try parser.accept(comptime Rules.oneOf(.{ .@",", delimiter }));
+                if (delimit.type == delimiter)
+                    break;
+            }
+        }
+        return head;
     }
 };
 
