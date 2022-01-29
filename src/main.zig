@@ -284,7 +284,21 @@ const Parser = struct {
                     };
                     return item;
                 },
+
+                .@"var" => {
+                    _ = try parser.accept(comptime Rules.is(.@"var"));
+                    const data = try parseVarDecl(ast, parser);
+
+                    const item = try ast.alloc(Ast.Statement);
+                    item.* = Ast.Statement{
+                        .data = .{ .local = data.@"var" },
+                        .next = null,
+                    };
+                    return item;
+                },
+
                 .@";" => {
+                    _ = try parser.accept(comptime Rules.is(.@";"));
                     const item = try ast.alloc(Ast.Statement);
                     item.* = Ast.Statement{
                         .data = .empty,
@@ -292,20 +306,37 @@ const Parser = struct {
                     };
                     return item;
                 },
+
                 .@"{" => return try parseBlock(ast, parser),
 
                 else => {},
             }
         }
 
-        return error.SyntaxError;
+        const expression = try parseExpression(ast, parser);
+        if (parser.accept(comptime Rules.is(.@"="))) |_| {
+            const value = try parseExpression(ast, parser);
+            _ = try parser.accept(comptime Rules.is(.@";"));
 
-        // const item = try ast.alloc(Ast.Statement);
-        // item.* = Ast.Statement{
-        //     .data = .empty,
-        //     .next = null,
-        // };
-        // return item;
+            const item = try ast.alloc(Ast.Statement);
+            item.* = Ast.Statement{
+                .data = .{ .assignment = Ast.Assignment{
+                    .target = expression,
+                    .value = value,
+                } },
+                .next = null,
+            };
+            return item;
+        } else |_| {
+            _ = try parser.accept(comptime Rules.is(.@";"));
+
+            const item = try ast.alloc(Ast.Statement);
+            item.* = Ast.Statement{
+                .data = .{ .expression = expression },
+                .next = null,
+            };
+            return item;
+        }
     }
 };
 
@@ -415,6 +446,10 @@ fn AstPrinter(comptime Writer: type) type {
                     } else {
                         try writer.writeAll("return;\n");
                     }
+                },
+                .local => |decl| {
+                    try printIndent(indent, writer);
+                    try printVarDecl(decl, writer);
                 },
             }
         }
@@ -615,6 +650,7 @@ const Ast = struct {
             @"break",
             @"continue",
             @"return": ?*Expression,
+            local: VarDeclaration,
         };
     };
 

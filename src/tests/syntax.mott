@@ -33,3 +33,19 @@ fn fn10 (a,b,c) {
 fn fn11 (a,b,c) {
   while(30) { }
 }
+
+fn fn12 () {
+  var local;
+}
+
+fn fn13 () {
+  var local = 200;
+}
+
+fn fn14() {
+  300;
+}
+
+fn fn15() {
+   varname = 400;
+}
