@@ -308,6 +308,10 @@ const Parser = struct {
             const value = try parseExpression(ast, parser);
             _ = try parser.accept(comptime Rules.is(.@";"));
 
+            if (!expression.isLValue()) {
+                std.log.err("syntax error: {}", .{parser.tokenizer.current_location});
+            }
+
             const item = try ast.alloc(Ast.Statement);
             item.* = Ast.Statement{
                 .data = .{ .assignment = Ast.Assignment{
@@ -375,20 +379,34 @@ const Parser = struct {
     fn parseSuffixOpExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
         var expr = try parseAtomExpression(ast, parser);
 
-        while (parser.accept(comptime Rules.oneOf(.{ .@"{", .@"[", .@"(" }))) |op| {
+        while (parser.accept(comptime Rules.oneOf(.{ .@"@", .@"[", .@"(" }))) |op| {
             switch (op.type) {
-                .@"{" => {
-                    const index = try parseExpression(ast, parser);
-                    _ = try parser.accept(comptime Rules.is(.@"}"));
+                .@"@" => {
+                    if (parser.accept(comptime Rules.is(.number))) |number| {
+                        const index = try ast.memoize(Ast.Expression{ .number = number.text });
 
-                    const value = expr;
-                    expr = try ast.memoize(Ast.Expression{
-                        .indexing = .{
-                            .word_size = .byte,
-                            .value = value,
-                            .index = index,
-                        },
-                    });
+                        const value = expr;
+                        expr = try ast.memoize(Ast.Expression{
+                            .indexing = .{
+                                .word_size = .byte,
+                                .value = value,
+                                .index = index,
+                            },
+                        });
+                    } else |_| {
+                        _ = try parser.accept(comptime Rules.is(.@"("));
+                        const index = try parseExpression(ast, parser);
+                        _ = try parser.accept(comptime Rules.is(.@")"));
+
+                        const value = expr;
+                        expr = try ast.memoize(Ast.Expression{
+                            .indexing = .{
+                                .word_size = .byte,
+                                .value = value,
+                                .index = index,
+                            },
+                        });
+                    }
                 },
                 .@"[" => {
                     const index = try parseExpression(ast, parser);
@@ -620,16 +638,25 @@ fn AstPrinter(comptime Writer: type) type {
                     try printExpr(val.value.*, writer);
                     try writer.writeAll(")");
                 },
-                .indexing => |val| {
-                    const braces = switch (val.word_size) {
-                        .byte => "{}",
-                        .word => "[]",
-                    };
+                .indexing => |val| switch (val.word_size) {
+                    .byte => {
+                        try printExpr(val.value.*, writer);
 
-                    try printExpr(val.value.*, writer);
-                    try writer.writeAll(braces[0..1]);
-                    try printExpr(val.index.*, writer);
-                    try writer.writeAll(braces[1..2]);
+                        if (val.index.* == .number) {
+                            try writer.writeAll("@");
+                            try printExpr(val.index.*, writer);
+                        } else {
+                            try writer.writeAll("(");
+                            try printExpr(val.index.*, writer);
+                            try writer.writeAll(")");
+                        }
+                    },
+                    .word => {
+                        try printExpr(val.value.*, writer);
+                        try writer.writeAll("[");
+                        try printExpr(val.index.*, writer);
+                        try writer.writeAll("]");
+                    },
                 },
                 .call => |val| {
                     try printExpr(val.function.*, writer);
@@ -720,6 +747,7 @@ const TokenType = enum(u8) {
     @"<<",
     @"!",
     @"~",
+    @"@",
 };
 
 const Pattern = ptk.Pattern(TokenType);
@@ -770,6 +798,7 @@ const Tokenizer = ptk.Tokenizer(TokenType, &.{
     Pattern.create(.@"~", ptk.matchers.literal("~")),
     Pattern.create(.@"=", ptk.matchers.literal("=")),
     Pattern.create(.@",", ptk.matchers.literal(",")),
+    Pattern.create(.@"@", ptk.matchers.literal("@")),
 
     Pattern.create(.identifier, ptk.matchers.identifier),
     Pattern.create(.number, ptk.matchers.decimalNumber),
@@ -884,6 +913,13 @@ const Ast = struct {
 
         call: Call,
         array_init: ArrayInitializer,
+
+        pub fn isLValue(self: @This()) bool {
+            return switch (self) {
+                .indexing, .identifier => true,
+                else => false,
+            };
+        }
     };
 
     pub const BinaryOperation = struct {

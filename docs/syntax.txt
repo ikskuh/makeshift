@@ -27,9 +27,11 @@ binary_sig  := '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '>' | '<' | '>=' 
 
 prefix_op   := ( '-' | '~' | '!' | '&' | '<<' | '>>' | '>>>' )+ <suffix_op>
 
-suffix_op   := <atom> '(' <params> ')' | <atom> '[' <expression> ']' | <atom> '{' <expression> '}' | <atom>
+suffix_op   := <atom> '(' <params> ')' | <atom> '[' <expression> ']' | <atom> '@' <number> |  <atom> '@' <paren_expr> | <atom>
 
-atom        := <identifier> | <number> | <string> | <byte_array> | <word_array> | '(' <expression> ')'
+atom        := <identifier> | <number> | <string> | <byte_array> | <word_array> | <paren_expr>
+
+paren_expr  := '(' <expression> ')'
 
 string      := '"' ( [^\\] | '\\' [.])* '"'
 byte_array  := '{' <expression> ( ',' <expression> )* '}'
