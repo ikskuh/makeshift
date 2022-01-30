@@ -1,0 +1,7 @@
+
+
+fn foo() {
+  var a;
+  var b = b;
+  a = b;
+}

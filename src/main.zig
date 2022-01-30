@@ -3,31 +3,260 @@ const ihex = @import("ihex");
 const ptk = @import("parser-toolkit");
 
 pub fn main() anyerror!void {
-    const demo_source = @embedFile("tests/syntax.mott");
+    const stdout = std.io.getStdOut();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var ast = try Parser.parse(gpa.allocator(), demo_source);
+    const demo_source = try std.fs.cwd().readFileAlloc(gpa.allocator(), "docs/scratchpad.mott", 1 << 16);
+    defer gpa.allocator().free(demo_source);
+
+    var diangostics = ptk.Diagnostics.init(gpa.allocator());
+    defer diangostics.deinit();
+
+    defer {
+        stdout.writeAll("Diagnostics:\n") catch {};
+        diangostics.print(stdout.writer()) catch {};
+    }
+
+    var ast = try Parser.parse(gpa.allocator(), demo_source, "docs/scratchpad.mott");
     defer ast.deinit();
 
-    const stdout = std.io.getStdOut();
     try AstPrinter(std.fs.File.Writer).print(ast, stdout.writer());
+
+    var env = try SemanticAnalysis.check(gpa.allocator(), &diangostics, ast);
+    defer env.deinit();
+
+    try Interpreter.run(&env, ast);
 }
 
 const Environment = struct {
-    memory: [32768]u16,
+    const Self = @This();
+
+    memory: [65536]u8,
+
+    globals: std.StringHashMap(u16),
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .memory = undefined,
+            .globals = std.StringHashMap(u16).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.globals.deinit();
+        self.* = undefined;
+    }
 };
 
-const Interpreter = struct {};
+const Interpreter = struct {
+    const Self = @This();
 
-const Parser = struct {
+    pub fn run(env: *Environment, ast: Ast) !void {
+        //
+        _ = env;
+        _ = ast;
+    }
+};
+
+pub const SemanticAnalysis = struct {
+    const Self = @This();
+
+    const AnalysisError = error{OutOfMemory};
+
+    allocator: std.mem.Allocator,
+    diagnostics: *ptk.Diagnostics,
+    ast: Ast,
+    env: *Environment,
+
+    pub fn check(allocator: std.mem.Allocator, diagnostics: *ptk.Diagnostics, ast: Ast) !Environment {
+        var memory = std.heap.ArenaAllocator.init(allocator);
+        defer memory.deinit();
+
+        var env = Environment.init(allocator);
+        errdefer env.deinit();
+
+        var sema = SemanticAnalysis{
+            .diagnostics = diagnostics,
+            .ast = ast,
+            .env = &env,
+            .allocator = allocator,
+        };
+
+        var next_decl = ast.top_level;
+        while (next_decl) |decl| : (next_decl = decl.next) {
+            const name = switch (decl.data) {
+                .@"var" => |val| val.name,
+                .@"const" => |val| val.name,
+                .@"fn" => |val| val.name,
+            };
+
+            const symbol = try env.globals.getOrPut(name);
+            if (symbol.found_existing) {
+                try diagnostics.emit(ptk.Location.empty, .@"error", "A symbol with the name `{s}` already exists.", .{name});
+            }
+
+            switch (decl.data) {
+                .@"var" => |d| if (d.value) |value| {
+                    try sema.validateExpr(value, &.{});
+                },
+                .@"const" => |d| try sema.validateExpr(d.value, &.{}),
+                .@"fn" => |d| try sema.validateFunction(d),
+            }
+        }
+
+        return env;
+    }
+
+    fn validateFunction(self: Self, func: Ast.FnDeclaration) AnalysisError!void {
+        var locals = std.ArrayList([]const u8).init(self.allocator);
+        defer locals.deinit();
+
+        var arg = func.parameters;
+        while (arg) |a| : (arg = a.next) {
+            try locals.append(a.name);
+        }
+
+        try self.validateBlock(func.body, &locals);
+    }
+
+    fn validateBlock(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!void {
+
+        // Allow variables with local scope to be declared until end-of-block.
+        // This allows simple reuse of stack slots.
+        const length = locals.items.len;
+        defer locals.shrinkRetainingCapacity(length);
+
+        var iter: ?*Ast.Statement = statement;
+        while (iter) |stmt| : (iter = stmt.next) {
+            try self.validateStatement(stmt, locals);
+        }
+    }
+
+    fn validateStatement(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!void {
+        switch (statement.data) {
+            .empty, .@"break", .@"continue" => {},
+
+            .expression => |expr| try self.validateExpr(expr, locals.items),
+            .assignment => |ass| {
+                if (!ass.target.isLValue()) {
+                    try self.diagnostics.emit(
+                        ptk.Location.empty,
+                        .@"error",
+                        "Left hand side of an assignment must be an lvalue.",
+                        .{},
+                    );
+                }
+
+                try self.validateExpr(ass.target, locals.items);
+                try self.validateExpr(ass.value, locals.items);
+            },
+            .conditional => |cond| {
+                try self.validateExpr(cond.condition, locals.items);
+
+                try self.validateBlock(cond.true_branch, locals);
+                if (cond.false_branch) |false_branch| {
+                    try self.validateBlock(false_branch, locals);
+                }
+            },
+            .loop => |loop| {
+                try self.validateExpr(loop.condition, locals.items);
+                try self.validateBlock(loop.body, locals);
+            },
+            .local => |local| {
+                if (local.value) |value| {
+                    try self.validateExpr(value, locals.items);
+                }
+                try locals.append(local.name);
+            },
+
+            .@"return" => |maybe_expr| if (maybe_expr) |expr| {
+                try self.validateExpr(expr, locals.items);
+            },
+        }
+    }
+
+    fn validateExpr(self: Self, expression: *Ast.Expression, locals: []const []const u8) AnalysisError!void {
+        switch (expression.*) {
+            .number => {
+                // always valid
+            },
+            .identifier => |ident| {
+                var valid = (getLocal(locals, ident) != null);
+                if (!valid) {
+                    valid = (self.env.globals.get(ident) != null);
+                }
+
+                if (!valid) {
+                    try self.diagnostics.emit(ptk.Location.empty, .@"error", "The function or variable `{s}` does not exist.", .{ident});
+                }
+            },
+            .string => {
+                @panic("string analysis not implemented yet!");
+            },
+            .binary_operation => |op| {
+                try self.validateExpr(op.lhs, locals);
+                try self.validateExpr(op.rhs, locals);
+            },
+            .unary_operation => |op| try self.validateExpr(op.value, locals),
+            .indexing => |op| {
+                try self.validateExpr(op.value, locals);
+                try self.validateExpr(op.index, locals);
+            },
+            .call => |call| {
+                try self.validateExpr(call.function, locals);
+                var iter = ListIterator.init(call.args);
+                while (iter.next()) |arg| {
+                    try self.validateExpr(arg.value, locals);
+                }
+            },
+            .array_init => |init| {
+                var iter = ListIterator.init(init.values);
+                while (iter.next()) |arg| {
+                    try self.validateExpr(arg.value, locals);
+                }
+            },
+        }
+    }
+
+    const ListIterator = struct {
+        list: ?*Ast.ValueList,
+
+        fn init(list: ?*Ast.ValueList) @This() {
+            return @This(){
+                .list = list,
+            };
+        }
+
+        pub fn next(self: *@This()) ?*Ast.ValueList {
+            if (self.list) |current| {
+                self.list = current.next;
+                return current;
+            } else {
+                return null;
+            }
+        }
+    };
+
+    fn getLocal(locals: []const []const u8, name: []const u8) ?usize {
+        var i = locals.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, locals[i], name))
+                return i;
+        }
+        return null;
+    }
+};
+
+pub const Parser = struct {
     const Self = @This();
     const Rules = ptk.RuleSet(TokenType);
     const Error = error{ OutOfMemory, SyntaxError } || ParserCore.AcceptError;
 
-    fn parse(allocator: std.mem.Allocator, source: []const u8) Error!Ast {
-        var tokenizer = Tokenizer.init(source);
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8, file_name: ?[]const u8) Error!Ast {
+        var tokenizer = Tokenizer.init(source, file_name);
         var core = ParserCore.init(&tokenizer);
 
         var ast = Ast.init(allocator);
@@ -307,10 +536,6 @@ const Parser = struct {
         if (parser.accept(comptime Rules.is(.@"="))) |_| {
             const value = try parseExpression(ast, parser);
             _ = try parser.accept(comptime Rules.is(.@";"));
-
-            if (!expression.isLValue()) {
-                std.log.err("syntax error: {}", .{parser.tokenizer.current_location});
-            }
 
             const item = try ast.alloc(Ast.Statement);
             item.* = Ast.Statement{
