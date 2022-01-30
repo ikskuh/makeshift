@@ -1,7 +1,19 @@
 
 
-fn foo() {
-  var a;
-  var b = b;
-  a = b;
+var uninit;
+var initialized = 1;
+var backref = initialized;
+var expr_1 = 1 + 2;
+var expr_2 = 1 + backref;
+
+const ten = 10;
+const twen = 20;
+
+fn add(a, b) {
+  return a + b;
 }
+
+const mop = add;
+
+const comptime = add(ten, twen);
+

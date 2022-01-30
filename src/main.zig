@@ -2,6 +2,8 @@ const std = @import("std");
 const ihex = @import("ihex");
 const ptk = @import("parser-toolkit");
 
+pub const Diagnostics = ptk.Diagnostics;
+
 pub fn main() anyerror!void {
     const stdout = std.io.getStdOut();
 
@@ -27,20 +29,52 @@ pub fn main() anyerror!void {
     var env = try SemanticAnalysis.check(gpa.allocator(), &diangostics, ast);
     defer env.deinit();
 
-    try Interpreter.run(&env, ast);
+    {
+        try stdout.writeAll("symbol tables:\n");
+
+        const mutable_names = [_][]const u8{ "const", "mutable" };
+
+        var iter = env.globals.iterator();
+        while (iter.next()) |symbol| {
+            try stdout.writer().print("- {s} {s} => 0x{X:0>4} = 0x{X:0>4}\n", .{
+                mutable_names[@boolToInt(symbol.value_ptr.isMutable())],
+                symbol.key_ptr.*,
+                symbol.value_ptr.address,
+                std.mem.readIntLittle(u16, env.memory[symbol.value_ptr.address..][0..2]),
+            });
+        }
+    }
+
+    var interpreter = Interpreter.init(gpa.allocator(), &env, ast);
+    try interpreter.run();
 }
+
+const SymbolKind = enum {
+    @"var",
+    @"fn",
+    @"const",
+};
+
+const Symbol = struct {
+    kind: SymbolKind,
+    address: u16,
+
+    pub fn isMutable(self: @This()) bool {
+        return (self.kind == .@"var");
+    }
+};
 
 const Environment = struct {
     const Self = @This();
 
     memory: [65536]u8,
 
-    globals: std.StringHashMap(u16),
+    globals: std.StringHashMap(Symbol),
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .memory = undefined,
-            .globals = std.StringHashMap(u16).init(allocator),
+            .globals = std.StringHashMap(Symbol).init(allocator),
         };
     }
 
@@ -53,10 +87,129 @@ const Environment = struct {
 const Interpreter = struct {
     const Self = @This();
 
-    pub fn run(env: *Environment, ast: Ast) !void {
+    env: *Environment,
+    ast: Ast,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, env: *Environment, ast: Ast) Self {
+        return Self{
+            .env = env,
+            .ast = ast,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn run(self: Self) !void {
+        _ = self;
+    }
+
+    const EvalError = error{ FunctionNotFound, OutOfMemory };
+    pub fn evaluate(self: Self, expr: Ast.Expression) EvalError!u16 {
+        return switch (expr) {
+            .number => |num| std.fmt.parseInt(u16, num, 0) catch unreachable, // we checked that in sema
+            .identifier => |ident| std.mem.readIntLittle(
+                u16,
+                self.env.memory[self.env.globals.get(ident).?.address..][0..2],
+            ),
+
+            .string => @panic("strings not implemented yet"),
+            .binary_operation => |op| blk: {
+                const lhs = try self.evaluate(op.lhs.*);
+                const rhs = try self.evaluate(op.rhs.*);
+                break :blk switch (op.operator) {
+                    .@"+" => lhs +% rhs,
+                    .@"-" => lhs -% rhs,
+                    .@"*" => lhs *% rhs,
+                    .@"/" => lhs / rhs,
+                    .@"%" => lhs % rhs,
+                    .@"&" => lhs & rhs,
+                    .@"|" => lhs | rhs,
+                    .@"^" => lhs ^ rhs,
+                    .@">" => @boolToInt(lhs > rhs),
+                    .@"<" => @boolToInt(lhs < rhs),
+                    .@">=" => @boolToInt(lhs >= rhs),
+                    .@"<=" => @boolToInt(lhs <= rhs),
+                    .@"==" => @boolToInt(lhs == rhs),
+                    .@"!=" => @boolToInt(lhs != rhs),
+                    .@"and" => @boolToInt((lhs != 0) and (rhs != 0)),
+                    .@"or" => @boolToInt((lhs != 0) or (rhs != 0)),
+                };
+            },
+            .unary_operation => |op| switch (op.operator) {
+                .@"-" => 0 -% (try self.evaluate(op.value.*)),
+                .@"~" => ~(try self.evaluate(op.value.*)),
+                .@"!" => @boolToInt((try self.evaluate(op.value.*)) != 0),
+                .@"&" => @panic("address of not implemented yet!"),
+                .@"<<" => (try self.evaluate(op.value.*)) << 1,
+                .@">>" => (try self.evaluate(op.value.*)) >> 1,
+                .@">>>" => blk: {
+                    const val = try self.evaluate(op.value.*);
+                    break :blk (0x8000 & val) | (val) >> 1;
+                },
+            },
+            .indexing => |op| blk: {
+                const address = try self.evaluate(op.value.*);
+                const index = try self.evaluate(op.index.*);
+
+                break :blk switch (op.word_size) {
+                    .byte => std.mem.readIntLittle(u8, self.env.memory[address + index ..][0..1]),
+                    .word => std.mem.readIntLittle(u16, self.env.memory[address + index ..][0..2]),
+                };
+            },
+            .call => |call| blk: {
+                const func_addr = try self.evaluate(call.function.*);
+
+                var argv = std.ArrayList(u16).init(self.allocator);
+                defer argv.deinit();
+
+                {
+                    var maybe_arg = call.args;
+                    while (maybe_arg) |arg| : (maybe_arg = arg.next) {
+                        const value = try self.evaluate(arg.value.*);
+                        try argv.append(value);
+                    }
+                }
+
+                const function = self.addr2name(func_addr) orelse return error.FunctionNotFound;
+
+                const result = try self.call(function, argv.items);
+
+                std.debug.print(
+                    "call: {} ({s})(* {d}) => {} \n",
+                    .{ func_addr, function, argv.items.len, result },
+                );
+
+                break :blk result;
+            },
+            .array_init => @panic("array initializer not implemented yet"),
+        };
+    }
+
+    pub fn call(self: Self, function: []const u8, argv: []const u16) EvalError!u16 {
+        var top_level = self.ast.top_level;
+        const func: Ast.FnDeclaration = while (top_level) |decl| : (top_level = decl.next) {
+            if (decl.data == .@"fn") {
+                if (std.mem.eql(u8, decl.data.@"fn".name, function))
+                    break decl.data.@"fn";
+            }
+        } else return error.FunctionNotFound;
+
+        std.debug.print("func: {}\n", .{func});
+
+        _ = self;
+        _ = function;
+        _ = argv;
         //
-        _ = env;
-        _ = ast;
+        return 0xABCD;
+    }
+
+    pub fn addr2name(self: Self, addr: u16) ?[]const u8 {
+        var iter = self.env.globals.iterator();
+        while (iter.next()) |sym| {
+            if (sym.value_ptr.address == addr)
+                return sym.key_ptr.*;
+        }
+        return null;
     }
 };
 
@@ -70,6 +223,8 @@ pub const SemanticAnalysis = struct {
     ast: Ast,
     env: *Environment,
 
+    write_pointer: u16,
+
     pub fn check(allocator: std.mem.Allocator, diagnostics: *ptk.Diagnostics, ast: Ast) !Environment {
         var memory = std.heap.ArenaAllocator.init(allocator);
         defer memory.deinit();
@@ -82,6 +237,7 @@ pub const SemanticAnalysis = struct {
             .ast = ast,
             .env = &env,
             .allocator = allocator,
+            .write_pointer = 0,
         };
 
         var next_decl = ast.top_level;
@@ -92,24 +248,77 @@ pub const SemanticAnalysis = struct {
                 .@"fn" => |val| val.name,
             };
 
-            const symbol = try env.globals.getOrPut(name);
-            if (symbol.found_existing) {
+            const gop = try env.globals.getOrPut(name);
+            if (gop.found_existing) {
                 try diagnostics.emit(ptk.Location.empty, .@"error", "A symbol with the name `{s}` already exists.", .{name});
             }
 
+            try sema.alignPointer(2);
+
+            var symbol = gop.value_ptr;
+            symbol.* = Symbol{
+                .kind = std.meta.activeTag(decl.data),
+                .address = sema.write_pointer,
+            };
+
+            // std.debug.print("analyze {s} => {}\n", .{ gop.key_ptr.*, symbol.* });
+
             switch (decl.data) {
                 .@"var" => |d| if (d.value) |value| {
-                    try sema.validateExpr(value, &.{});
+                    if (try sema.validateExpr(value, &.{})) {
+                        var interpreter = Interpreter.init(allocator, &env, ast);
+
+                        const init_value = try interpreter.evaluate(value.*);
+                        try sema.write16(init_value);
+                    } else {
+                        try sema.write16(0xAAAA);
+                    }
+                } else {
+                    try sema.write16(0); // default to zero
                 },
-                .@"const" => |d| try sema.validateExpr(d.value, &.{}),
-                .@"fn" => |d| try sema.validateFunction(d),
+                .@"const" => |d| if (try sema.validateExpr(d.value, &.{})) {
+                    var interpreter = Interpreter.init(allocator, &env, ast);
+
+                    const init_value = try interpreter.evaluate(d.value.*);
+                    try sema.write16(init_value);
+                } else {
+                    try sema.write16(0xAAAA);
+                },
+                .@"fn" => |d| {
+                    _ = try sema.validateFunction(d);
+
+                    // for interpreter, emit address to self
+                    try sema.write16(symbol.address);
+                },
             }
         }
 
         return env;
     }
 
-    fn validateFunction(self: Self, func: Ast.FnDeclaration) AnalysisError!void {
+    fn alignPointer(self: *Self, alignment: u16) !void {
+        self.write_pointer = try std.math.cast(u16, std.mem.alignForward(self.write_pointer, alignment));
+    }
+
+    fn tryMovePointer(self: Self, size: u16) !u16 {
+        if (self.write_pointer >= std.math.maxInt(u16) - size)
+            return error.Overflow;
+        return self.write_pointer + size;
+    }
+
+    fn write8(self: *Self, value: u8) !void {
+        const next = try self.tryMovePointer(1);
+        std.mem.writeIntLittle(u8, self.env.memory[self.write_pointer..][0..1], value);
+        self.write_pointer = next;
+    }
+
+    fn write16(self: *Self, value: u16) !void {
+        const next = try self.tryMovePointer(2);
+        std.mem.writeIntLittle(u16, self.env.memory[self.write_pointer..][0..2], value);
+        self.write_pointer = next;
+    }
+
+    fn validateFunction(self: Self, func: Ast.FnDeclaration) AnalysisError!bool {
         var locals = std.ArrayList([]const u8).init(self.allocator);
         defer locals.deinit();
 
@@ -118,10 +327,11 @@ pub const SemanticAnalysis = struct {
             try locals.append(a.name);
         }
 
-        try self.validateBlock(func.body, &locals);
+        return try self.validateBlock(func.body, &locals);
     }
 
-    fn validateBlock(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!void {
+    fn validateBlock(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!bool {
+        var good = Fuse{};
 
         // Allow variables with local scope to be declared until end-of-block.
         // This allows simple reuse of stack slots.
@@ -130,15 +340,18 @@ pub const SemanticAnalysis = struct {
 
         var iter: ?*Ast.Statement = statement;
         while (iter) |stmt| : (iter = stmt.next) {
-            try self.validateStatement(stmt, locals);
+            good.update(try self.validateStatement(stmt, locals));
         }
+
+        return good.state;
     }
 
-    fn validateStatement(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!void {
+    fn validateStatement(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!bool {
+        var good = Fuse{};
         switch (statement.data) {
             .empty, .@"break", .@"continue" => {},
 
-            .expression => |expr| try self.validateExpr(expr, locals.items),
+            .expression => |expr| good.update(try self.validateExpr(expr, locals.items)),
             .assignment => |ass| {
                 if (!ass.target.isLValue()) {
                     try self.diagnostics.emit(
@@ -147,48 +360,56 @@ pub const SemanticAnalysis = struct {
                         "Left hand side of an assignment must be an lvalue.",
                         .{},
                     );
+                    good.burn();
                 }
 
-                try self.validateExpr(ass.target, locals.items);
-                try self.validateExpr(ass.value, locals.items);
+                good.update(try self.validateExpr(ass.target, locals.items));
+                good.update(try self.validateExpr(ass.value, locals.items));
+
+                return good.state;
             },
             .conditional => |cond| {
-                try self.validateExpr(cond.condition, locals.items);
+                good.update(try self.validateExpr(cond.condition, locals.items));
 
-                try self.validateBlock(cond.true_branch, locals);
+                good.update(try self.validateBlock(cond.true_branch, locals));
                 if (cond.false_branch) |false_branch| {
-                    try self.validateBlock(false_branch, locals);
+                    good.update(try self.validateBlock(false_branch, locals));
                 }
             },
             .loop => |loop| {
-                try self.validateExpr(loop.condition, locals.items);
-                try self.validateBlock(loop.body, locals);
+                good.update(try self.validateExpr(loop.condition, locals.items));
+                good.update(try self.validateBlock(loop.body, locals));
             },
             .local => |local| {
                 if (local.value) |value| {
-                    try self.validateExpr(value, locals.items);
+                    good.update(try self.validateExpr(value, locals.items));
                 }
                 try locals.append(local.name);
             },
 
             .@"return" => |maybe_expr| if (maybe_expr) |expr| {
-                try self.validateExpr(expr, locals.items);
+                good.update(try self.validateExpr(expr, locals.items));
             },
         }
+        return good.state;
     }
 
-    fn validateExpr(self: Self, expression: *Ast.Expression, locals: []const []const u8) AnalysisError!void {
+    fn validateExpr(self: Self, expression: *Ast.Expression, locals: []const []const u8) AnalysisError!bool {
+        var good = Fuse{};
         switch (expression.*) {
-            .number => {
-                // always valid
+            .number => |val| {
+                _ = std.fmt.parseInt(u16, val, 0) catch {
+                    try self.diagnostics.emit(ptk.Location.empty, .@"error", "The number `{s}` is out of range. Valid numbers are between 0 and 65535.", .{val});
+                    good.burn();
+                };
             },
             .identifier => |ident| {
-                var valid = (getLocal(locals, ident) != null);
-                if (!valid) {
-                    valid = (self.env.globals.get(ident) != null);
+                var exists = (getLocal(locals, ident) != null);
+                if (!exists) {
+                    exists = (self.env.globals.get(ident) != null);
                 }
-
-                if (!valid) {
+                good.update(exists);
+                if (good.state == false) {
                     try self.diagnostics.emit(ptk.Location.empty, .@"error", "The function or variable `{s}` does not exist.", .{ident});
                 }
             },
@@ -196,28 +417,45 @@ pub const SemanticAnalysis = struct {
                 @panic("string analysis not implemented yet!");
             },
             .binary_operation => |op| {
-                try self.validateExpr(op.lhs, locals);
-                try self.validateExpr(op.rhs, locals);
+                good.update(try self.validateExpr(op.lhs, locals));
+                good.update(try self.validateExpr(op.rhs, locals));
             },
-            .unary_operation => |op| try self.validateExpr(op.value, locals),
+            .unary_operation => |op| good.update(try self.validateExpr(op.value, locals)),
             .indexing => |op| {
-                try self.validateExpr(op.value, locals);
-                try self.validateExpr(op.index, locals);
+                good.update(try self.validateExpr(op.value, locals));
+                good.update(try self.validateExpr(op.index, locals));
             },
             .call => |call| {
-                try self.validateExpr(call.function, locals);
+                good.update(try self.validateExpr(call.function, locals));
+
+                var argc: usize = 0;
                 var iter = ListIterator.init(call.args);
                 while (iter.next()) |arg| {
-                    try self.validateExpr(arg.value, locals);
+                    good.update(try self.validateExpr(arg.value, locals));
+                    argc += 1;
+                }
+
+                if (call.function.* == .identifier) {
+                    if (self.env.globals.get(call.function.identifier)) |glob| {
+                        if (glob.kind != .@"fn") {
+                            try self.diagnostics.emit(ptk.Location.empty, .warning, "The callee `{s}` is not a function. This might be a mistake.", .{call.function.identifier});
+                        }
+                    }
+
+                    // computeListLen(
+
+                } else {
+                    // we cannot be sure about stuff
                 }
             },
             .array_init => |init| {
                 var iter = ListIterator.init(init.values);
                 while (iter.next()) |arg| {
-                    try self.validateExpr(arg.value, locals);
+                    good.update(try self.validateExpr(arg.value, locals));
                 }
             },
         }
+        return good.state;
     }
 
     const ListIterator = struct {
@@ -248,6 +486,19 @@ pub const SemanticAnalysis = struct {
         }
         return null;
     }
+
+    const Fuse = struct {
+        state: bool = true,
+
+        pub fn update(self: *@This(), good: bool) void {
+            if (!good)
+                self.state = false;
+        }
+
+        pub fn burn(self: *@This()) void {
+            self.state = false;
+        }
+    };
 };
 
 pub const Parser = struct {
@@ -1065,7 +1316,7 @@ const Ast = struct {
         next: ?*@This(),
         data: Data,
 
-        const Data = union(enum) {
+        const Data = union(SymbolKind) {
             @"var": VarDeclaration,
             @"const": ConstDeclaration,
             @"fn": FnDeclaration,
@@ -1225,4 +1476,13 @@ fn tokenToEnumVal(token: TokenType, comptime T: type) T {
             return @field(T, fld.name);
     }
     @panic("received invalid token. check the pattern matching before!");
+}
+
+fn computeListLen(ptr: anytype) usize {
+    var count: usize = 0;
+    var iter = ptr;
+    while (iter) |p| : (iter = p.next) {
+        count += 1;
+    }
+    return count;
 }
