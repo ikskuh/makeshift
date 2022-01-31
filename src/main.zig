@@ -103,19 +103,58 @@ const Interpreter = struct {
         _ = self;
     }
 
-    const EvalError = error{ FunctionNotFound, OutOfMemory };
-    pub fn evaluate(self: Self, expr: Ast.Expression) EvalError!u16 {
+    const Locals = struct {
+        items: std.ArrayList(Local),
+
+        const Local = struct {
+            value: u16,
+            name: []const u8,
+        };
+
+        fn getIndex(self: @This(), name: []const u8) ?usize {
+            var i = self.items.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, self.items.items[i].name, name))
+                    return i;
+            }
+            return null;
+        }
+
+        fn get(self: @This(), name: []const u8) ?u16 {
+            return if (self.getIndex(name)) |index|
+                self.items.items[index].value
+            else
+                null;
+        }
+
+        fn set(self: *@This(), name: []const u8, value: u16) bool {
+            const index = self.getIndex(name) orelse return false;
+            self.items.items[index].value = value;
+            return true;
+        }
+    };
+
+    const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory };
+    pub fn evaluate(self: Self, expr: Ast.Expression, locals: ?Locals) EvalError!u16 {
         return switch (expr) {
             .number => |num| std.fmt.parseInt(u16, num, 0) catch unreachable, // we checked that in sema
-            .identifier => |ident| std.mem.readIntLittle(
-                u16,
-                self.env.memory[self.env.globals.get(ident).?.address..][0..2],
-            ),
+            .identifier => |ident| blk: {
+                if (locals) |l| {
+                    if (l.get(ident)) |local|
+                        break :blk local;
+                }
+
+                break :blk std.mem.readIntLittle(
+                    u16,
+                    self.env.memory[self.env.globals.get(ident).?.address..][0..2],
+                );
+            },
 
             .string => @panic("strings not implemented yet"),
             .binary_operation => |op| blk: {
-                const lhs = try self.evaluate(op.lhs.*);
-                const rhs = try self.evaluate(op.rhs.*);
+                const lhs = try self.evaluate(op.lhs.*, locals);
+                const rhs = try self.evaluate(op.rhs.*, locals);
                 break :blk switch (op.operator) {
                     .@"+" => lhs +% rhs,
                     .@"-" => lhs -% rhs,
@@ -135,21 +174,21 @@ const Interpreter = struct {
                     .@"or" => @boolToInt((lhs != 0) or (rhs != 0)),
                 };
             },
-            .unary_operation => |op| switch (op.operator) {
-                .@"-" => 0 -% (try self.evaluate(op.value.*)),
-                .@"~" => ~(try self.evaluate(op.value.*)),
-                .@"!" => @boolToInt((try self.evaluate(op.value.*)) != 0),
-                .@"&" => @panic("address of not implemented yet!"),
-                .@"<<" => (try self.evaluate(op.value.*)) << 1,
-                .@">>" => (try self.evaluate(op.value.*)) >> 1,
-                .@">>>" => blk: {
-                    const val = try self.evaluate(op.value.*);
-                    break :blk (0x8000 & val) | (val) >> 1;
-                },
+            .unary_operation => |op| blk: {
+                const value = try self.evaluate(op.value.*, locals);
+                break :blk switch (op.operator) {
+                    .@"-" => 0 -% value,
+                    .@"~" => ~value,
+                    .@"!" => @boolToInt(value != 0),
+                    .@"&" => @panic("address of not implemented yet!"),
+                    .@"<<" => value << 1,
+                    .@">>" => value >> 1,
+                    .@">>>" => (0x8000 & value) | (value) >> 1,
+                };
             },
             .indexing => |op| blk: {
-                const address = try self.evaluate(op.value.*);
-                const index = try self.evaluate(op.index.*);
+                const address = try self.evaluate(op.value.*, locals);
+                const index = try self.evaluate(op.index.*, locals);
 
                 break :blk switch (op.word_size) {
                     .byte => std.mem.readIntLittle(u8, self.env.memory[address + index ..][0..1]),
@@ -157,7 +196,7 @@ const Interpreter = struct {
                 };
             },
             .call => |call| blk: {
-                const func_addr = try self.evaluate(call.function.*);
+                const func_addr = try self.evaluate(call.function.*, locals);
 
                 var argv = std.ArrayList(u16).init(self.allocator);
                 defer argv.deinit();
@@ -165,7 +204,7 @@ const Interpreter = struct {
                 {
                     var maybe_arg = call.args;
                     while (maybe_arg) |arg| : (maybe_arg = arg.next) {
-                        const value = try self.evaluate(arg.value.*);
+                        const value = try self.evaluate(arg.value.*, locals);
                         try argv.append(value);
                     }
                 }
@@ -194,13 +233,117 @@ const Interpreter = struct {
             }
         } else return error.FunctionNotFound;
 
-        std.debug.print("func: {}\n", .{func});
+        var locals = Locals{
+            .items = std.ArrayList(Locals.Local).init(self.allocator),
+        };
+        defer locals.items.deinit();
 
-        _ = self;
-        _ = function;
-        _ = argv;
-        //
-        return 0xABCD;
+        {
+            var i: usize = 0;
+            var iter = func.parameters;
+            while (iter) |param| : (iter = param.next) {
+                if (i >= argv.len)
+                    return error.InvalidArgumentCount;
+
+                try locals.items.append(.{ .name = param.name, .value = argv[i] });
+
+                i += 1;
+            }
+            if (i != argv.len)
+                return error.InvalidArgumentCount;
+        }
+
+        const result = try self.evaluateBlock(func.body, &locals);
+        return switch (result) {
+            .default => 0,
+            .@"return" => |val| val,
+            .@"break" => unreachable, // already caught by sema.
+            .@"continue" => unreachable, // already caught by sema.
+        };
+    }
+
+    const StatementResult = union(enum) {
+        default,
+        @"break",
+        @"continue",
+        @"return": u16,
+    };
+
+    fn evaluateBlock(self: Self, block: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
+        const locals_at_start = locals.items.items.len;
+        defer locals.items.shrinkRetainingCapacity(locals_at_start);
+
+        var iter: ?*Ast.Statement = block;
+        while (iter) |stmt| : (iter = stmt.next) {
+            const res = try self.evaluateStatement(stmt, locals);
+            if (res != .default)
+                return res;
+        }
+        return .default;
+    }
+
+    fn evaluateStatement(self: Self, stmt: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
+        switch (stmt.data) {
+            .empty => return .default,
+            .expression => |expr| {
+                _ = try self.evaluate(expr.*, locals.*);
+                return .default;
+            },
+            .assignment => |ass| {
+                const value = try self.evaluate(ass.value.*, locals.*);
+                _ = value;
+                @panic("assignment not implemented yet!");
+            },
+            .conditional => |cond| {
+                const condition = try self.evaluate(cond.condition.*, locals.*);
+
+                const result = if (condition != 0)
+                    try self.evaluateBlock(cond.true_branch, locals)
+                else if (cond.false_branch) |false_branch|
+                    try self.evaluateBlock(false_branch, locals)
+                else
+                    .default;
+
+                return result;
+            },
+            .loop => |loop| {
+                while (true) {
+                    const condition = try self.evaluate(loop.condition.*, locals.*);
+                    if (condition == 0)
+                        break;
+
+                    const result = try self.evaluateBlock(loop.body, locals);
+                    switch (result) {
+                        .default, .@"continue" => {},
+                        .@"break" => break,
+                        .@"return" => return result,
+                    }
+                }
+                return .default;
+            },
+            .@"break" => return .@"break",
+            .@"continue" => return .@"continue",
+            .@"return" => |maybe_expr| {
+                const result = if (maybe_expr) |expr|
+                    try self.evaluate(expr.*, locals.*)
+                else
+                    0;
+                return StatementResult{ .@"return" = result };
+            },
+            .local => |def| {
+                const init_value = if (def.value) |expr|
+                    try self.evaluate(expr.*, locals.*)
+                else
+                    0;
+
+                try locals.items.append(.{
+                    .name = def.name,
+                    .value = init_value,
+                });
+
+                return .default;
+            },
+        }
     }
 
     pub fn addr2name(self: Self, addr: u16) ?[]const u8 {
@@ -268,7 +411,7 @@ pub const SemanticAnalysis = struct {
                     if (try sema.validateExpr(value, &.{})) {
                         var interpreter = Interpreter.init(allocator, &env, ast);
 
-                        const init_value = try interpreter.evaluate(value.*);
+                        const init_value = try interpreter.evaluate(value.*, null);
                         try sema.write16(init_value);
                     } else {
                         try sema.write16(0xAAAA);
@@ -279,7 +422,7 @@ pub const SemanticAnalysis = struct {
                 .@"const" => |d| if (try sema.validateExpr(d.value, &.{})) {
                     var interpreter = Interpreter.init(allocator, &env, ast);
 
-                    const init_value = try interpreter.evaluate(d.value.*);
+                    const init_value = try interpreter.evaluate(d.value.*, null);
                     try sema.write16(init_value);
                 } else {
                     try sema.write16(0xAAAA);

@@ -17,3 +17,6 @@ const mop = add;
 
 const comptime = add(ten, twen);
 
+fn foo(a) {
+  return a;
+}
