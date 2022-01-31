@@ -91,6 +91,20 @@ const Interpreter = struct {
     ast: Ast,
     allocator: std.mem.Allocator,
 
+    stack_pointer: u16 = 0, // this is actually "end of memory"
+
+    fn push(self: *Self, value: u16) u16 {
+        self.stack_pointer -%= 2;
+        std.mem.writeIntLittle(u16, self.env.memory[self.stack_pointer..][0..2], value);
+        return self.stack_pointer;
+    }
+
+    fn pop(self: Self) u16 {
+        const value = std.mem.readIntLittle(u16, self.env.memory[self.stack_pointer..][0..2]);
+        self.stack_pointer +%= 2;
+        return value;
+    }
+
     pub fn init(allocator: std.mem.Allocator, env: *Environment, ast: Ast) Self {
         return Self{
             .env = env,
@@ -104,10 +118,12 @@ const Interpreter = struct {
     }
 
     const Locals = struct {
+        // TODO: Replace with references to memory instead of separately stored.
+        // Otherwise `&local` cannot be implemented.
         items: std.ArrayList(Local),
 
         const Local = struct {
-            value: u16,
+            address: u16,
             name: []const u8,
         };
 
@@ -121,33 +137,32 @@ const Interpreter = struct {
             return null;
         }
 
-        fn get(self: @This(), name: []const u8) ?u16 {
+        fn getAddress(self: @This(), name: []const u8) ?u16 {
             return if (self.getIndex(name)) |index|
-                self.items.items[index].value
+                self.items.items[index].address
             else
                 null;
-        }
-
-        fn set(self: *@This(), name: []const u8, value: u16) bool {
-            const index = self.getIndex(name) orelse return false;
-            self.items.items[index].value = value;
-            return true;
         }
     };
 
     const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory };
-    pub fn evaluate(self: Self, expr: Ast.Expression, locals: ?Locals) EvalError!u16 {
+    pub fn evaluate(self: *Self, expr: Ast.Expression, locals: ?Locals) EvalError!u16 {
         return switch (expr) {
             .number => |num| std.fmt.parseInt(u16, num, 0) catch unreachable, // we checked that in sema
             .identifier => |ident| blk: {
-                if (locals) |l| {
-                    if (l.get(ident)) |local|
-                        break :blk local;
-                }
+                const maybe_local_address = if (locals) |l|
+                    if (l.getAddress(ident)) |local|
+                        local
+                    else
+                        null
+                else
+                    null;
+
+                const address = maybe_local_address orelse self.env.globals.get(ident).?.address;
 
                 break :blk std.mem.readIntLittle(
                     u16,
-                    self.env.memory[self.env.globals.get(ident).?.address..][0..2],
+                    self.env.memory[address..][0..2],
                 );
             },
 
@@ -224,7 +239,7 @@ const Interpreter = struct {
         };
     }
 
-    pub fn call(self: Self, function: []const u8, argv: []const u16) EvalError!u16 {
+    pub fn call(self: *Self, function: []const u8, argv: []const u16) EvalError!u16 {
         var top_level = self.ast.top_level;
         const func: Ast.FnDeclaration = while (top_level) |decl| : (top_level = decl.next) {
             if (decl.data == .@"fn") {
@@ -238,6 +253,9 @@ const Interpreter = struct {
         };
         defer locals.items.deinit();
 
+        const stack_depth_at_start = self.stack_pointer;
+        defer self.stack_pointer = stack_depth_at_start;
+
         {
             var i: usize = 0;
             var iter = func.parameters;
@@ -245,7 +263,9 @@ const Interpreter = struct {
                 if (i >= argv.len)
                     return error.InvalidArgumentCount;
 
-                try locals.items.append(.{ .name = param.name, .value = argv[i] });
+                const address = self.push(argv[i]);
+
+                try locals.items.append(.{ .name = param.name, .address = address });
 
                 i += 1;
             }
@@ -269,9 +289,12 @@ const Interpreter = struct {
         @"return": u16,
     };
 
-    fn evaluateBlock(self: Self, block: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
+    fn evaluateBlock(self: *Self, block: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
         const locals_at_start = locals.items.items.len;
         defer locals.items.shrinkRetainingCapacity(locals_at_start);
+
+        const stack_depth_at_start = self.stack_pointer;
+        defer self.stack_pointer = stack_depth_at_start;
 
         var iter: ?*Ast.Statement = block;
         while (iter) |stmt| : (iter = stmt.next) {
@@ -282,7 +305,7 @@ const Interpreter = struct {
         return .default;
     }
 
-    fn evaluateStatement(self: Self, stmt: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
+    fn evaluateStatement(self: *Self, stmt: *Ast.Statement, locals: *Locals) EvalError!StatementResult {
         switch (stmt.data) {
             .empty => return .default,
             .expression => |expr| {
@@ -290,9 +313,15 @@ const Interpreter = struct {
                 return .default;
             },
             .assignment => |ass| {
+                // TODO: Prevent assignment to globals
                 const value = try self.evaluate(ass.value.*, locals.*);
-                _ = value;
-                @panic("assignment not implemented yet!");
+                const address = try self.computeLValueAddress(ass.target.*, locals);
+
+                switch (address.size) {
+                    .byte => std.mem.writeIntLittle(u8, self.env.memory[address.address..][0..1], @truncate(u8, value)),
+                    .word => std.mem.writeIntLittle(u16, self.env.memory[address.address..][0..2], value),
+                }
+                return .default;
             },
             .conditional => |cond| {
                 const condition = try self.evaluate(cond.condition.*, locals.*);
@@ -336,14 +365,46 @@ const Interpreter = struct {
                 else
                     0;
 
+                const address = self.push(init_value);
+
                 try locals.items.append(.{
                     .name = def.name,
-                    .value = init_value,
+                    .address = address,
                 });
 
                 return .default;
             },
         }
+    }
+
+    const LValue = struct {
+        address: u16,
+        size: MemoryAccessSize,
+    };
+    fn computeLValueAddress(self: *Self, expr: Ast.Expression, locals: *Locals) EvalError!LValue {
+        std.debug.assert(expr.isLValue());
+
+        switch (expr) {
+            .indexing => |indexer| {
+                const address = try self.evaluate(indexer.value.*, locals.*);
+                const offset = try self.evaluate(indexer.index.*, locals.*);
+                return switch (indexer.word_size) {
+                    .word => LValue{ .address = address +% 2 *% offset, .size = .word },
+                    .byte => LValue{ .address = address +% 1 *% offset, .size = .byte },
+                };
+            },
+
+            .identifier => |name| {
+                if (locals.getAddress(name)) |address|
+                    return LValue{ .address = address, .size = .word };
+
+                return LValue{ .address = self.env.globals.get(name).?.address, .size = .word };
+            },
+
+            else => unreachable, // is checked by isLValue() above
+        }
+
+        return 0;
     }
 
     pub fn addr2name(self: Self, addr: u16) ?[]const u8 {
@@ -492,7 +553,10 @@ pub const SemanticAnalysis = struct {
     fn validateStatement(self: Self, statement: *Ast.Statement, locals: *std.ArrayList([]const u8)) AnalysisError!bool {
         var good = Fuse{};
         switch (statement.data) {
-            .empty, .@"break", .@"continue" => {},
+            .empty => {},
+
+            // TODO: Only valid inside a loop construct
+            .@"break", .@"continue" => {},
 
             .expression => |expr| good.update(try self.validateExpr(expr, locals.items)),
             .assignment => |ass| {

@@ -17,6 +17,9 @@ const mop = add;
 
 const comptime = add(ten, twen);
 
-fn foo(a) {
-  return a;
+fn storeLocal(a) {
+  var b = a;
+  return b;
 }
+
+const stored_local = storeLocal(3);
