@@ -1,8 +1,11 @@
 
 
+const x = 1337;
+const y = x;
+
 var uninit;
-var initialized = 1;
-var backref = initialized;
+const initialized = 1;
+const backref = initialized;
 var expr_1 = 1 + 2;
 var expr_2 = 1 + backref;
 
@@ -23,3 +26,12 @@ fn storeLocal(a) {
 }
 
 const stored_local = storeLocal(3);
+
+var foo;
+var addr_of_foo = &foo;
+
+fn storeGlobal(a) {
+  addr_of_foo[0] = a;
+}
+
+const side_effect = storeGlobal(10);

@@ -84,7 +84,7 @@ const Environment = struct {
     }
 };
 
-const Interpreter = struct {
+pub const Interpreter = struct {
     const Self = @This();
 
     env: *Environment,
@@ -92,6 +92,8 @@ const Interpreter = struct {
     allocator: std.mem.Allocator,
 
     stack_pointer: u16 = 0, // this is actually "end of memory"
+
+    comptime_execution: bool = false,
 
     fn push(self: *Self, value: u16) u16 {
         self.stack_pointer -%= 2;
@@ -118,8 +120,6 @@ const Interpreter = struct {
     }
 
     const Locals = struct {
-        // TODO: Replace with references to memory instead of separately stored.
-        // Otherwise `&local` cannot be implemented.
         items: std.ArrayList(Local),
 
         const Local = struct {
@@ -145,7 +145,13 @@ const Interpreter = struct {
         }
     };
 
-    const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory };
+    fn isInStackFrame(self: Self, ptr: u16) bool {
+        const is = (self.stack_pointer != 0) and (ptr >= self.stack_pointer);
+        // std.debug.print("isInStackFrame(0x{X:0>4}) => {}\n", .{ ptr, is });
+        return is;
+    }
+
+    const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory, WriteToRuntimeData, ReadFromRuntimeData };
     pub fn evaluate(self: *Self, expr: Ast.Expression, locals: ?Locals) EvalError!u16 {
         return switch (expr) {
             .number => |num| std.fmt.parseInt(u16, num, 0) catch unreachable, // we checked that in sema
@@ -158,7 +164,16 @@ const Interpreter = struct {
                 else
                     null;
 
-                const address = maybe_local_address orelse self.env.globals.get(ident).?.address;
+                var is_const = false;
+                const address = maybe_local_address orelse b: {
+                    const glob = self.env.globals.get(ident).?;
+                    is_const = !glob.isMutable();
+                    break :b glob.address;
+                };
+
+                if (self.comptime_execution and !is_const and !self.isInStackFrame(address)) {
+                    return error.ReadFromRuntimeData;
+                }
 
                 break :blk std.mem.readIntLittle(
                     u16,
@@ -190,12 +205,16 @@ const Interpreter = struct {
                 };
             },
             .unary_operation => |op| blk: {
+                if (op.operator == .@"&") {
+                    const address = try self.computeLValueAddress(op.value.*, locals);
+                    break :blk address.address;
+                }
                 const value = try self.evaluate(op.value.*, locals);
                 break :blk switch (op.operator) {
                     .@"-" => 0 -% value,
                     .@"~" => ~value,
                     .@"!" => @boolToInt(value != 0),
-                    .@"&" => @panic("address of not implemented yet!"),
+                    .@"&" => unreachable,
                     .@"<<" => value << 1,
                     .@">>" => value >> 1,
                     .@">>>" => (0x8000 & value) | (value) >> 1,
@@ -228,10 +247,10 @@ const Interpreter = struct {
 
                 const result = try self.call(function, argv.items);
 
-                std.debug.print(
-                    "call: {} ({s})(* {d}) => {} \n",
-                    .{ func_addr, function, argv.items.len, result },
-                );
+                // std.debug.print(
+                //     "call: {} ({s})(* {d}) => {} \n",
+                //     .{ func_addr, function, argv.items.len, result },
+                // );
 
                 break :blk result;
             },
@@ -313,9 +332,14 @@ const Interpreter = struct {
                 return .default;
             },
             .assignment => |ass| {
-                // TODO: Prevent assignment to globals
+                // TODO: Prevent assignment to globals for comptime scope
+
                 const value = try self.evaluate(ass.value.*, locals.*);
-                const address = try self.computeLValueAddress(ass.target.*, locals);
+                const address = try self.computeLValueAddress(ass.target.*, locals.*);
+
+                if (self.comptime_execution and !self.isInStackFrame(address.address)) {
+                    return error.WriteToRuntimeData;
+                }
 
                 switch (address.size) {
                     .byte => std.mem.writeIntLittle(u8, self.env.memory[address.address..][0..1], @truncate(u8, value)),
@@ -381,13 +405,13 @@ const Interpreter = struct {
         address: u16,
         size: MemoryAccessSize,
     };
-    fn computeLValueAddress(self: *Self, expr: Ast.Expression, locals: *Locals) EvalError!LValue {
+    fn computeLValueAddress(self: *Self, expr: Ast.Expression, locals: ?Locals) EvalError!LValue {
         std.debug.assert(expr.isLValue());
 
         switch (expr) {
             .indexing => |indexer| {
-                const address = try self.evaluate(indexer.value.*, locals.*);
-                const offset = try self.evaluate(indexer.index.*, locals.*);
+                const address = try self.evaluate(indexer.value.*, locals);
+                const offset = try self.evaluate(indexer.index.*, locals);
                 return switch (indexer.word_size) {
                     .word => LValue{ .address = address +% 2 *% offset, .size = .word },
                     .byte => LValue{ .address = address +% 1 *% offset, .size = .byte },
@@ -395,8 +419,10 @@ const Interpreter = struct {
             },
 
             .identifier => |name| {
-                if (locals.getAddress(name)) |address|
-                    return LValue{ .address = address, .size = .word };
+                if (locals != null) {
+                    if (locals.?.getAddress(name)) |address|
+                        return LValue{ .address = address, .size = .word };
+                }
 
                 return LValue{ .address = self.env.globals.get(name).?.address, .size = .word };
             },
@@ -444,6 +470,8 @@ pub const SemanticAnalysis = struct {
             .write_pointer = 0,
         };
 
+        var has_main = false;
+
         var next_decl = ast.top_level;
         while (next_decl) |decl| : (next_decl = decl.next) {
             const name = switch (decl.data) {
@@ -451,6 +479,13 @@ pub const SemanticAnalysis = struct {
                 .@"const" => |val| val.name,
                 .@"fn" => |val| val.name,
             };
+
+            if (std.mem.eql(u8, name, "main")) {
+                has_main = true;
+                if (decl.data != .@"fn") {
+                    try diagnostics.emit(ptk.Location.empty, .@"warning", "The entry point `{s}` should be a function.", .{name});
+                }
+            }
 
             const gop = try env.globals.getOrPut(name);
             if (gop.found_existing) {
@@ -469,25 +504,11 @@ pub const SemanticAnalysis = struct {
 
             switch (decl.data) {
                 .@"var" => |d| if (d.value) |value| {
-                    if (try sema.validateExpr(value, &.{})) {
-                        var interpreter = Interpreter.init(allocator, &env, ast);
-
-                        const init_value = try interpreter.evaluate(value.*, null);
-                        try sema.write16(init_value);
-                    } else {
-                        try sema.write16(0xAAAA);
-                    }
+                    try sema.initDeclValue(value);
                 } else {
                     try sema.write16(0); // default to zero
                 },
-                .@"const" => |d| if (try sema.validateExpr(d.value, &.{})) {
-                    var interpreter = Interpreter.init(allocator, &env, ast);
-
-                    const init_value = try interpreter.evaluate(d.value.*, null);
-                    try sema.write16(init_value);
-                } else {
-                    try sema.write16(0xAAAA);
-                },
+                .@"const" => |d| try sema.initDeclValue(d.value),
                 .@"fn" => |d| {
                     _ = try sema.validateFunction(d);
 
@@ -497,7 +518,36 @@ pub const SemanticAnalysis = struct {
             }
         }
 
+        if (!has_main) {
+            try diagnostics.emit(ptk.Location.empty, .@"warning", "No entry point with the name `main` found.", .{});
+        }
+
         return env;
+    }
+
+    fn initDeclValue(self: *Self, value: *Ast.Expression) !void {
+        if (try self.validateExpr(value, &.{})) {
+            var interpreter = Interpreter.init(self.allocator, self.env, self.ast);
+            interpreter.comptime_execution = true;
+
+            const init_value = interpreter.evaluate(value.*, null) catch |err| switch (err) {
+                error.WriteToRuntimeData => {
+                    try self.diagnostics.emit(ptk.Location.empty, .@"error", "Cannot evaluate constant expression. Write to runtime data.", .{});
+                    try self.write16(0xAAAA);
+                    return;
+                },
+                error.ReadFromRuntimeData => {
+                    try self.diagnostics.emit(ptk.Location.empty, .@"error", "Cannot evaluate constant expression. Read from runtime data.", .{});
+                    try self.write16(0xAAAA);
+                    return;
+                },
+
+                else => |e| return e,
+            };
+            try self.write16(init_value);
+        } else {
+            try self.write16(0xAAAA);
+        }
     }
 
     fn alignPointer(self: *Self, alignment: u16) !void {
