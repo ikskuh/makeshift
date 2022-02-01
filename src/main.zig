@@ -17,36 +17,44 @@ pub fn main() anyerror!void {
     defer diangostics.deinit();
 
     defer {
-        stdout.writeAll("Diagnostics:\n") catch {};
-        diangostics.print(stdout.writer()) catch {};
+        if (diangostics.errors.items.len > 0) {
+            stdout.writeAll("Diagnostics:\n") catch {};
+            diangostics.print(stdout.writer()) catch {};
+        }
     }
 
     var ast = try Parser.parse(gpa.allocator(), demo_source, "docs/scratchpad.mott");
     defer ast.deinit();
 
-    try AstPrinter(std.fs.File.Writer).print(ast, stdout.writer());
+    // try AstPrinter(std.fs.File.Writer).print(ast, stdout.writer());
 
     var env = try SemanticAnalysis.check(gpa.allocator(), &diangostics, ast);
     defer env.deinit();
 
     {
-        try stdout.writeAll("symbol tables:\n");
+        try stdout.writeAll("Mutable | Offset | Value  | Name\n");
+        try stdout.writeAll("--------+--------+--------+------------------------\n");
 
-        const mutable_names = [_][]const u8{ "const", "mutable" };
+        const mutable_names = [_][]const u8{
+            "const  ",
+            "mutable",
+        };
 
         var iter = env.globals.iterator();
         while (iter.next()) |symbol| {
-            try stdout.writer().print("- {s} {s} => 0x{X:0>4} = 0x{X:0>4}\n", .{
+            try stdout.writer().print("{s} | 0x{X:0>4} | 0x{X:0>4} | {s}\n", .{
                 mutable_names[@boolToInt(symbol.value_ptr.isMutable())],
-                symbol.key_ptr.*,
                 symbol.value_ptr.address,
                 std.mem.readIntLittle(u16, env.memory[symbol.value_ptr.address..][0..2]),
+                symbol.key_ptr.*,
             });
         }
     }
 
     var interpreter = Interpreter.init(gpa.allocator(), &env, ast);
-    try interpreter.run();
+    const result = try interpreter.run();
+
+    try stdout.writer().print("main() => {}\n", .{result});
 }
 
 const SymbolKind = enum {
@@ -94,6 +102,7 @@ pub const Interpreter = struct {
     stack_pointer: u16 = 0, // this is actually "end of memory"
 
     comptime_execution: bool = false,
+    const_data_pointer: ?*u16 = null,
 
     fn push(self: *Self, value: u16) u16 {
         self.stack_pointer -%= 2;
@@ -115,8 +124,8 @@ pub const Interpreter = struct {
         };
     }
 
-    pub fn run(self: Self) !void {
-        _ = self;
+    pub fn run(self: *Self) !u16 {
+        return try self.call("main", &.{});
     }
 
     const Locals = struct {
@@ -151,7 +160,7 @@ pub const Interpreter = struct {
         return is;
     }
 
-    const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory, WriteToRuntimeData, ReadFromRuntimeData };
+    const EvalError = error{ FunctionNotFound, InvalidArgumentCount, OutOfMemory, WriteToRuntimeData, ReadFromRuntimeData, Overflow };
     pub fn evaluate(self: *Self, expr: Ast.Expression, locals: ?Locals) EvalError!u16 {
         return switch (expr) {
             .number => |num| std.fmt.parseInt(u16, num, 0) catch unreachable, // we checked that in sema
@@ -182,6 +191,7 @@ pub const Interpreter = struct {
             },
 
             .string => @panic("strings not implemented yet"),
+
             .binary_operation => |op| blk: {
                 const lhs = try self.evaluate(op.lhs.*, locals);
                 const rhs = try self.evaluate(op.rhs.*, locals);
@@ -226,7 +236,7 @@ pub const Interpreter = struct {
 
                 break :blk switch (op.word_size) {
                     .byte => std.mem.readIntLittle(u8, self.env.memory[address + index ..][0..1]),
-                    .word => std.mem.readIntLittle(u16, self.env.memory[address + index ..][0..2]),
+                    .word => std.mem.readIntLittle(u16, self.env.memory[address + 2 * index ..][0..2]),
                 };
             },
             .call => |call| blk: {
@@ -254,7 +264,71 @@ pub const Interpreter = struct {
 
                 break :blk result;
             },
-            .array_init => @panic("array initializer not implemented yet"),
+            .array_init => |array| blk: {
+                const abs_increment = switch (array.word_size) {
+                    .byte => @as(u2, 1),
+                    .word => @as(u2, 2),
+                };
+
+                const mem = &self.env.memory;
+
+                if (self.const_data_pointer) |ptr| {
+                    // write to global memory
+                    const start_address = ptr.*;
+
+                    var iter = ListIterator.init(array.values);
+                    while (iter.next()) |item| {
+                        // std.debug.print("store {} at {}\n", .{
+                        //     array.word_size,
+                        //     ptr.*,
+                        // });
+
+                        const value = try self.evaluate(item.value.*, locals);
+
+                        switch (array.word_size) {
+                            .byte => std.mem.writeIntLittle(u8, mem[ptr.*..][0..1], @truncate(u8, value)),
+                            .word => std.mem.writeIntLittle(u16, mem[ptr.*..][0..2], value),
+                        }
+
+                        ptr.* +%= abs_increment;
+                    }
+
+                    break :blk start_address;
+                } else {
+                    const count = b: {
+                        var c: usize = 0;
+                        var iter = ListIterator.init(array.values);
+                        while (iter.next()) |_| {
+                            c += 1;
+                        }
+                        break :b c;
+                    };
+
+                    const block_size = try std.math.cast(u16, std.mem.alignForward(abs_increment * count, 2));
+                    self.stack_pointer -%= block_size;
+
+                    var ptr = self.stack_pointer;
+
+                    var iter = ListIterator.init(array.values);
+                    while (iter.next()) |item| {
+                        // std.debug.print("store {} at {}\n", .{
+                        //     array.word_size,
+                        //     ptr,
+                        // });
+
+                        const value = try self.evaluate(item.value.*, locals);
+
+                        switch (array.word_size) {
+                            .byte => std.mem.writeIntLittle(u8, mem[ptr..][0..1], @truncate(u8, value)),
+                            .word => std.mem.writeIntLittle(u16, mem[ptr..][0..2], value),
+                        }
+
+                        ptr +%= abs_increment;
+                    }
+
+                    break :blk self.stack_pointer;
+                }
+            },
         };
     }
 
@@ -504,11 +578,11 @@ pub const SemanticAnalysis = struct {
 
             switch (decl.data) {
                 .@"var" => |d| if (d.value) |value| {
-                    try sema.initDeclValue(value);
+                    symbol.address = try sema.initDeclValue(value);
                 } else {
                     try sema.write16(0); // default to zero
                 },
-                .@"const" => |d| try sema.initDeclValue(d.value),
+                .@"const" => |d| symbol.address = try sema.initDeclValue(d.value),
                 .@"fn" => |d| {
                     _ = try sema.validateFunction(d);
 
@@ -518,36 +592,39 @@ pub const SemanticAnalysis = struct {
             }
         }
 
-        if (!has_main) {
-            try diagnostics.emit(ptk.Location.empty, .@"warning", "No entry point with the name `main` found.", .{});
-        }
+        // if (!has_main) {
+        //     try diagnostics.emit(ptk.Location.empty, .@"warning", "No entry point with the name `main` found.", .{});
+        // }
 
         return env;
     }
 
-    fn initDeclValue(self: *Self, value: *Ast.Expression) !void {
-        if (try self.validateExpr(value, &.{})) {
+    fn initDeclValue(self: *Self, value: *Ast.Expression) !u16 {
+        const init_value = if (try self.validateExpr(value, &.{})) blk: {
             var interpreter = Interpreter.init(self.allocator, self.env, self.ast);
             interpreter.comptime_execution = true;
+            interpreter.const_data_pointer = &self.write_pointer;
 
             const init_value = interpreter.evaluate(value.*, null) catch |err| switch (err) {
                 error.WriteToRuntimeData => {
                     try self.diagnostics.emit(ptk.Location.empty, .@"error", "Cannot evaluate constant expression. Write to runtime data.", .{});
                     try self.write16(0xAAAA);
-                    return;
+                    return self.write_pointer - 2;
                 },
                 error.ReadFromRuntimeData => {
                     try self.diagnostics.emit(ptk.Location.empty, .@"error", "Cannot evaluate constant expression. Read from runtime data.", .{});
                     try self.write16(0xAAAA);
-                    return;
+                    return self.write_pointer - 2;
                 },
 
                 else => |e| return e,
             };
-            try self.write16(init_value);
-        } else {
-            try self.write16(0xAAAA);
-        }
+            break :blk init_value;
+        } else 0xAAAA;
+
+        const addr = self.write_pointer;
+        try self.write16(init_value);
+        return addr;
     }
 
     fn alignPointer(self: *Self, alignment: u16) !void {
@@ -714,26 +791,6 @@ pub const SemanticAnalysis = struct {
         }
         return good.state;
     }
-
-    const ListIterator = struct {
-        list: ?*Ast.ValueList,
-
-        fn init(list: ?*Ast.ValueList) @This() {
-            return @This(){
-                .list = list,
-            };
-        }
-
-        pub fn next(self: *@This()) ?*Ast.ValueList {
-            if (self.list) |current| {
-                self.list = current.next;
-                return current;
-            } else {
-                return null;
-            }
-        }
-    };
-
     fn getLocal(locals: []const []const u8, name: []const u8) ?usize {
         var i = locals.len;
         while (i > 0) {
@@ -756,6 +813,25 @@ pub const SemanticAnalysis = struct {
             self.state = false;
         }
     };
+};
+
+const ListIterator = struct {
+    list: ?*Ast.ValueList,
+
+    fn init(list: ?*Ast.ValueList) @This() {
+        return @This(){
+            .list = list,
+        };
+    }
+
+    pub fn next(self: *@This()) ?*Ast.ValueList {
+        if (self.list) |current| {
+            self.list = current.next;
+            return current;
+        } else {
+            return null;
+        }
+    }
 };
 
 pub const Parser = struct {

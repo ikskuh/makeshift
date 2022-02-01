@@ -1,37 +1,10 @@
 
+const data = [ 10, 20, 30 ];
 
-const x = 1337;
-const y = x;
+fn main() {
+  var before = 0;
+  var locals = [ 40, 50, 60 ];
+  var after = 0;
 
-var uninit;
-const initialized = 1;
-const backref = initialized;
-var expr_1 = 1 + 2;
-var expr_2 = 1 + backref;
-
-const ten = 10;
-const twen = 20;
-
-fn add(a, b) {
-  return a + b;
+  return before + after;
 }
-
-const mop = add;
-
-const comptime = add(ten, twen);
-
-fn storeLocal(a) {
-  var b = a;
-  return b;
-}
-
-const stored_local = storeLocal(3);
-
-var foo;
-var addr_of_foo = &foo;
-
-fn storeGlobal(a) {
-  addr_of_foo[0] = a;
-}
-
-const side_effect = storeGlobal(10);
