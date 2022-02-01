@@ -4,7 +4,7 @@ const ptk = @import("parser-toolkit");
 
 pub const Diagnostics = ptk.Diagnostics;
 
-pub fn main() anyerror!void {
+pub fn main() anyerror!u8 {
     const stdout = std.io.getStdOut();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -26,7 +26,12 @@ pub fn main() anyerror!void {
     var ast = try Parser.parse(gpa.allocator(), demo_source, "docs/scratchpad.mott");
     defer ast.deinit();
 
-    // try AstPrinter(std.fs.File.Writer).print(ast, stdout.writer());
+    {
+        var dump = try std.fs.cwd().createFile("/tmp/parse.mott", .{});
+        defer dump.close();
+
+        try AstPrinter(std.fs.File.Writer).print(ast, dump.writer());
+    }
 
     var env = try SemanticAnalysis.check(gpa.allocator(), &diangostics, ast);
     defer env.deinit();
@@ -51,10 +56,23 @@ pub fn main() anyerror!void {
         }
     }
 
+    if (diangostics.hasErrors()) {
+        return 1;
+    }
+
     var interpreter = Interpreter.init(gpa.allocator(), &env, ast);
-    const result = try interpreter.run();
+
+    const string_ptr = try interpreter.alloca(100);
+    const string = interpreter.getMemoryRange(string_ptr, 100);
+    std.mem.copy(u8, string, "Hello World!\x00");
+
+    const result = try interpreter.run(&.{ 1, string_ptr });
 
     try stdout.writer().print("main() => {}\n", .{result});
+
+    try stdout.writer().print("'{s}'\n", .{std.mem.sliceTo(string, 0)});
+
+    return 0;
 }
 
 const SymbolKind = enum {
@@ -116,6 +134,16 @@ pub const Interpreter = struct {
         return value;
     }
 
+    pub fn alloca(self: *Self, size: usize) !u16 {
+        const block_size = try std.math.cast(u16, std.mem.alignForward(size, 2));
+        self.stack_pointer -%= block_size;
+        return self.stack_pointer;
+    }
+
+    pub fn getMemoryRange(self: *Self, ptr: u16, len: usize) []u8 {
+        return self.env.memory[ptr .. ptr + len];
+    }
+
     pub fn init(allocator: std.mem.Allocator, env: *Environment, ast: Ast) Self {
         return Self{
             .env = env,
@@ -124,8 +152,8 @@ pub const Interpreter = struct {
         };
     }
 
-    pub fn run(self: *Self) !u16 {
-        return try self.call("main", &.{});
+    pub fn run(self: *Self, argv: []const u16) !u16 {
+        return try self.call("main", argv);
     }
 
     const Locals = struct {
@@ -304,10 +332,9 @@ pub const Interpreter = struct {
                         break :b c;
                     };
 
-                    const block_size = try std.math.cast(u16, std.mem.alignForward(abs_increment * count, 2));
-                    self.stack_pointer -%= block_size;
+                    const start_address = try self.alloca(abs_increment * count);
 
-                    var ptr = self.stack_pointer;
+                    var ptr = start_address;
 
                     var iter = ListIterator.init(array.values);
                     while (iter.next()) |item| {
@@ -317,7 +344,6 @@ pub const Interpreter = struct {
                         // });
 
                         const value = try self.evaluate(item.value.*, locals);
-
                         switch (array.word_size) {
                             .byte => std.mem.writeIntLittle(u8, mem[ptr..][0..1], @truncate(u8, value)),
                             .word => std.mem.writeIntLittle(u16, mem[ptr..][0..2], value),
@@ -326,7 +352,7 @@ pub const Interpreter = struct {
                         ptr +%= abs_increment;
                     }
 
-                    break :blk self.stack_pointer;
+                    break :blk start_address;
                 }
             },
         };
@@ -1317,7 +1343,7 @@ fn AstPrinter(comptime Writer: type) type {
         pub const Error = Writer.Error;
 
         const indent_char = " ";
-        const indent_level = 4;
+        const indent_level = 2;
 
         fn print(ast: Ast, writer: Writer) Error!void {
             var next_node = ast.top_level;
