@@ -218,7 +218,15 @@ pub const Interpreter = struct {
                 );
             },
 
-            .string => @panic("strings not implemented yet"),
+            .string => |text| blk: {
+                const mem = &self.env.memory;
+
+                const start_address = try self.allocExpressionMemory(text.len + 1);
+                std.mem.copy(u8, mem[start_address..], text);
+                mem[start_address + text.len] = 0;
+
+                break :blk start_address;
+            },
 
             .binary_operation => |op| blk: {
                 const lhs = try self.evaluate(op.lhs.*, locals);
@@ -293,69 +301,58 @@ pub const Interpreter = struct {
                 break :blk result;
             },
             .array_init => |array| blk: {
+                const mem = &self.env.memory;
+
                 const abs_increment = switch (array.word_size) {
                     .byte => @as(u2, 1),
                     .word => @as(u2, 2),
                 };
 
-                const mem = &self.env.memory;
-
-                if (self.const_data_pointer) |ptr| {
-                    // write to global memory
-                    const start_address = ptr.*;
-
+                const count = b: {
+                    var c: usize = 0;
                     var iter = ListIterator.init(array.values);
-                    while (iter.next()) |item| {
-                        // std.debug.print("store {} at {}\n", .{
-                        //     array.word_size,
-                        //     ptr.*,
-                        // });
+                    while (iter.next()) |_| {
+                        c += 1;
+                    }
+                    break :b c;
+                };
 
-                        const value = try self.evaluate(item.value.*, locals);
+                const start_address = try self.allocExpressionMemory(abs_increment * count);
 
-                        switch (array.word_size) {
-                            .byte => std.mem.writeIntLittle(u8, mem[ptr.*..][0..1], @truncate(u8, value)),
-                            .word => std.mem.writeIntLittle(u16, mem[ptr.*..][0..2], value),
-                        }
+                var ptr = start_address;
 
-                        ptr.* +%= abs_increment;
+                var iter = ListIterator.init(array.values);
+                while (iter.next()) |item| {
+                    // std.debug.print("store {} at {}\n", .{
+                    //     array.word_size,
+                    //     ptr,
+                    // });
+
+                    const value = try self.evaluate(item.value.*, locals);
+                    switch (array.word_size) {
+                        .byte => std.mem.writeIntLittle(u8, mem[ptr..][0..1], @truncate(u8, value)),
+                        .word => std.mem.writeIntLittle(u16, mem[ptr..][0..2], value),
                     }
 
-                    break :blk start_address;
-                } else {
-                    const count = b: {
-                        var c: usize = 0;
-                        var iter = ListIterator.init(array.values);
-                        while (iter.next()) |_| {
-                            c += 1;
-                        }
-                        break :b c;
-                    };
-
-                    const start_address = try self.alloca(abs_increment * count);
-
-                    var ptr = start_address;
-
-                    var iter = ListIterator.init(array.values);
-                    while (iter.next()) |item| {
-                        // std.debug.print("store {} at {}\n", .{
-                        //     array.word_size,
-                        //     ptr,
-                        // });
-
-                        const value = try self.evaluate(item.value.*, locals);
-                        switch (array.word_size) {
-                            .byte => std.mem.writeIntLittle(u8, mem[ptr..][0..1], @truncate(u8, value)),
-                            .word => std.mem.writeIntLittle(u16, mem[ptr..][0..2], value),
-                        }
-
-                        ptr +%= abs_increment;
-                    }
-
-                    break :blk start_address;
+                    ptr +%= abs_increment;
                 }
+
+                break :blk start_address;
             },
         };
+    }
+
+    fn allocExpressionMemory(self: *Self, size: usize) !u16 {
+        const aligned_size = std.mem.alignForward(size, 2);
+
+        if (self.const_data_pointer) |ptr| {
+            // write to global memory
+            const start_address = ptr.*;
+            ptr.* +%= @intCast(u16, aligned_size);
+            return start_address;
+        } else {
+            return try self.alloca(aligned_size);
+        }
     }
 
     pub fn call(self: *Self, function: []const u8, argv: []const u16) EvalError!u16 {
@@ -774,7 +771,8 @@ pub const SemanticAnalysis = struct {
                 }
             },
             .string => {
-                @panic("string analysis not implemented yet!");
+                // strings are basically always good
+                // TODO: Verify string escape sequences.
             },
             .binary_operation => |op| {
                 good.update(try self.validateExpr(op.lhs, locals));
@@ -1276,10 +1274,11 @@ pub const Parser = struct {
     }
 
     fn parseAtomExpression(ast: *Ast, parser: *ParserCore) Error!*Ast.Expression {
-        const start_token = try parser.accept(comptime Rules.oneOf(.{ .number, .identifier, .@"(", .@"[", .@"{" }));
+        const start_token = try parser.accept(comptime Rules.oneOf(.{ .number, .identifier, .string, .@"(", .@"[", .@"{" }));
         return switch (start_token.type) {
             .number => try ast.memoize(Ast.Expression{ .number = start_token.text }),
             .identifier => try ast.memoize(Ast.Expression{ .identifier = start_token.text }),
+            .string => try ast.memoize(Ast.Expression{ .string = start_token.text }),
 
             .@"{" => {
                 const list = try parseValueList(ast, parser, .@"}");
@@ -1541,6 +1540,7 @@ const TokenType = enum(u8) {
 
     identifier,
     number,
+    string,
 
     @"var",
     @"const",
@@ -1637,7 +1637,27 @@ const Tokenizer = ptk.Tokenizer(TokenType, &.{
 
     Pattern.create(.identifier, ptk.matchers.identifier),
     Pattern.create(.number, ptk.matchers.decimalNumber),
+    Pattern.create(.string, matchString),
 });
+
+pub fn matchString(str: []const u8) ?usize {
+    if (str.len < 2)
+        return null;
+    if (str[0] != '\"')
+        return null;
+
+    var i: usize = 1;
+    while (i < str.len) {
+        if (str[i] == '\"') {
+            return i + 1;
+        } else if (str[i] == '\\') {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    return null;
+}
 
 const ParserCore = ptk.ParserCore(Tokenizer, .{ .comment, .whitespace });
 

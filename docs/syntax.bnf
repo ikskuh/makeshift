@@ -1,7 +1,7 @@
 
-TOP         := <vardecl> | <constdecl> | <fndecl> 
+program     := <declaration> *
 
-comment     := '#' [^\n]+
+declaration := <vardecl> | <constdecl> | <fndecl> 
 
 vardecl     := 'var'   <identifier> '=' <expresion> ';'
 constdecl   := 'const' <identifier> '=' <expresion> ';'

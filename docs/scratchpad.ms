@@ -1,4 +1,5 @@
 
+const string = "Hello, World!";
 
 fn strlen(ptr) {
   var len = 0;
@@ -9,5 +10,5 @@ fn strlen(ptr) {
 }
 
 fn main(argc, argv) {
-  return strlen(argv);
+  return strlen("hi");
 }
