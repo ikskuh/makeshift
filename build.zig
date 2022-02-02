@@ -22,7 +22,7 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("mott", "src/main.zig");
+    const exe = b.addExecutable("makeshift", "src/main.zig");
     exe.addPackage(pkgs.ptk);
     exe.addPackage(pkgs.ihex);
     exe.setTarget(target);

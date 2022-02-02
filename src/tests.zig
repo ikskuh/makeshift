@@ -1,5 +1,5 @@
 const std = @import("std");
-const mott = @import("main.zig");
+const makeshift = @import("main.zig");
 
 comptime {
     _ = @import("tests/syntax.zig");

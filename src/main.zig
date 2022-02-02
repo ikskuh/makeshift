@@ -10,7 +10,7 @@ pub fn main() anyerror!u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const demo_source = try std.fs.cwd().readFileAlloc(gpa.allocator(), "docs/scratchpad.mott", 1 << 16);
+    const demo_source = try std.fs.cwd().readFileAlloc(gpa.allocator(), "docs/scratchpad.ms", 1 << 16);
     defer gpa.allocator().free(demo_source);
 
     var diangostics = ptk.Diagnostics.init(gpa.allocator());
@@ -23,11 +23,11 @@ pub fn main() anyerror!u8 {
         }
     }
 
-    var ast = try Parser.parse(gpa.allocator(), demo_source, "docs/scratchpad.mott");
+    var ast = try Parser.parse(gpa.allocator(), demo_source, "docs/scratchpad.ms");
     defer ast.deinit();
 
     {
-        var dump = try std.fs.cwd().createFile("/tmp/parse.mott", .{});
+        var dump = try std.fs.cwd().createFile("/tmp/parse.ms", .{});
         defer dump.close();
 
         try AstPrinter(std.fs.File.Writer).print(ast, dump.writer());

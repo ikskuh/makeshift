@@ -1,14 +1,14 @@
 const std = @import("std");
-const mott = @import("../main.zig");
+const makeshift = @import("../main.zig");
 
 fn expectError(source: []const u8, comptime errors: []const []const u8) !void {
-    var diagnostics = mott.Diagnostics.init(std.testing.allocator);
+    var diagnostics = makeshift.Diagnostics.init(std.testing.allocator);
     defer diagnostics.deinit();
 
-    var ast = try mott.Parser.parse(std.testing.allocator, source, null);
+    var ast = try makeshift.Parser.parse(std.testing.allocator, source, null);
     defer ast.deinit();
 
-    var env = try mott.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
+    var env = try makeshift.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
     defer env.deinit();
 
     try std.testing.expectEqual(errors.len, diagnostics.errors.items.len);
@@ -18,31 +18,31 @@ fn expectError(source: []const u8, comptime errors: []const []const u8) !void {
 }
 
 fn compileExpectNoError(source: []const u8) !void {
-    var diagnostics = mott.Diagnostics.init(std.testing.allocator);
+    var diagnostics = makeshift.Diagnostics.init(std.testing.allocator);
     defer diagnostics.deinit();
 
-    var ast = try mott.Parser.parse(std.testing.allocator, source, null);
+    var ast = try makeshift.Parser.parse(std.testing.allocator, source, null);
     defer ast.deinit();
 
-    var env = try mott.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
+    var env = try makeshift.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
     defer env.deinit();
 
     try std.testing.expect(!diagnostics.hasErrors());
 }
 
 fn runExpectNoError(expected_result: u16, source: []const u8) !void {
-    var diagnostics = mott.Diagnostics.init(std.testing.allocator);
+    var diagnostics = makeshift.Diagnostics.init(std.testing.allocator);
     defer diagnostics.deinit();
 
-    var ast = try mott.Parser.parse(std.testing.allocator, source, null);
+    var ast = try makeshift.Parser.parse(std.testing.allocator, source, null);
     defer ast.deinit();
 
-    var env = try mott.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
+    var env = try makeshift.SemanticAnalysis.check(std.testing.allocator, &diagnostics, ast);
     defer env.deinit();
 
     try std.testing.expect(!diagnostics.hasErrors());
 
-    var interpreter = mott.Interpreter.init(std.testing.allocator, &env, ast);
+    var interpreter = makeshift.Interpreter.init(std.testing.allocator, &env, ast);
     const actual_result = try interpreter.run(&.{});
 
     try std.testing.expectEqual(expected_result, actual_result);

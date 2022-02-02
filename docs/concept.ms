@@ -1,7 +1,6 @@
 # single-char comment for simplicity
 
-# mott changes:
-# - stringdexing op necessary
+# makeshift changes:
 # - prefilled array syntax
 
 var foo;     # global variable, uninitialized

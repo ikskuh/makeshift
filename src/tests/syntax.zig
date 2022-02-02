@@ -1,21 +1,21 @@
 const std = @import("std");
-const mott = @import("../main.zig");
+const makeshift = @import("../main.zig");
 
 test "all syntax constructs" {
-    const demo_source = @embedFile("syntax.mott");
+    const demo_source = @embedFile("syntax.ms");
 
-    var ast = try mott.Parser.parse(std.testing.allocator, demo_source, "src/tests/syntax.mott");
+    var ast = try makeshift.Parser.parse(std.testing.allocator, demo_source, "src/tests/syntax.ms");
     defer ast.deinit();
 }
 
 fn expectError(source: []const u8, comptime errors: []const []const u8) !void {
-    var diangostics = mott.Diagnostics.init(std.testing.allocator);
+    var diangostics = makeshift.Diagnostics.init(std.testing.allocator);
     defer diangostics.deinit();
 
-    var ast = try mott.Parser.parse(std.testing.allocator, source, null);
+    var ast = try makeshift.Parser.parse(std.testing.allocator, source, null);
     defer ast.deinit();
 
-    var env = try mott.SemanticAnalysis.check(std.testing.allocator, &diangostics, ast);
+    var env = try makeshift.SemanticAnalysis.check(std.testing.allocator, &diangostics, ast);
     defer env.deinit();
 
     try std.testing.expectEqual(errors.len, diangostics.errors.items.len);
@@ -25,13 +25,13 @@ fn expectError(source: []const u8, comptime errors: []const []const u8) !void {
 }
 
 fn expectNoError(source: []const u8) !void {
-    var diangostics = mott.Diagnostics.init(std.testing.allocator);
+    var diangostics = makeshift.Diagnostics.init(std.testing.allocator);
     defer diangostics.deinit();
 
-    var ast = try mott.Parser.parse(std.testing.allocator, source, null);
+    var ast = try makeshift.Parser.parse(std.testing.allocator, source, null);
     defer ast.deinit();
 
-    var env = try mott.SemanticAnalysis.check(std.testing.allocator, &diangostics, ast);
+    var env = try makeshift.SemanticAnalysis.check(std.testing.allocator, &diangostics, ast);
     defer env.deinit();
 
     try std.testing.expect(!diangostics.hasErrors());
