@@ -17,7 +17,15 @@ import_table:  u32,
 string_table:  u32,
 section_start: u32,
 section_size:  u32,
+symbol_size:   u8,  // is one of { 1, 2, 4, 8 }
 ```
+
+- `export_table`: The byte offset into the file where the exports are listed. If `0`, no export table exists.
+- `import_table`: The byte offset into the file where the imports are listed. If `0`, no import table exists.
+- `string_table`: The byte offset into the file where the string table is located. If `0`, no string table exists. Must be present, if either `export_table` or `import_table` exists.
+- `section_start`: The byte offset into the file where the memory section starts. All section offsets are relative to this offset.
+- `section_size`: The number of bytes in the memory section.
+- `symbol_size` specifies the pointer size of this module. This means that each symbol has pointer size of `symbol_size` bytes.
 
 ### Export/Import Table
 
