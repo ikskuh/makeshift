@@ -4,3 +4,6 @@
 [submodule "vendor/parser-toolkit"]
 	path = vendor/parser-toolkit
 	url = https://github.com/MasterQ32/parser-toolkit
+[submodule "vendor/libslf"]
+	path = vendor/libslf
+	url = https://github.com/MasterQ32/libslf
