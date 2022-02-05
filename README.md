@@ -33,4 +33,21 @@ fn main() {
 
 The parser and interpreter for Makeshift is implemented already, but the compiler and (optional) optimizer is still missing.
 
+### TODO
 
+- [ ] Optimize string handling
+  - [ ] Put strings into global memory instead of stack for temporaries
+  - [ ] Deduplicate strings
+- [ ] New feature: Pre-initialized sized memory ("give me 20 bytes")
+- [ ] SPU 2 Compiler
+  - [ ] Compile to intermediate modules
+    - [ ] Modules have export table (symbol name => offset)
+    - [ ] Modules have import table (offset => symbol name)
+  - [ ] Allow linking of several modules into one
+  - [ ] Modules can be hand-written with assembler
+  - [ ] Link modules together into a final binary
+- [ ] Expression optimizer
+  - [ ] Recursively try to replace constant parts in expressions.
+    - [ ] If a expression is comptime evaluatable, it can be replaced by the equivalent `number` expression, even when function calls are incorporated (just apply the same rules as for top-level expressions).
+  - [ ] Deduplication of constants with the same value
+  - [ ]
